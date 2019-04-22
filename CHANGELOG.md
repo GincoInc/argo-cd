@@ -18,8 +18,6 @@ Argo CD introduces Custom Resource Actions to allow users to provide their own L
 * The health of more resources is displayed, so it easier to quickly zoom to unhealthy pods, replica-sets, etc.
 * Resources that do not have health no longer appear to be healthy. 
 
-#### Other Notable Changes
-
 ### Breaking Changes
 
 * Remove deprecated componentParameterOverrides field #1372
