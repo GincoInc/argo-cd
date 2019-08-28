@@ -35,9 +35,16 @@ func (n *node) resourceKey() kube.ResourceKey {
 }
 
 func (n *node) isParentOf(child *node) bool {
-	for _, ownerRef := range child.ownerRefs {
-		ownerGvk := schema.FromAPIVersionAndKind(ownerRef.APIVersion, ownerRef.Kind)
-		if kube.NewResourceKey(ownerGvk.Group, ownerRef.Kind, n.ref.Namespace, ownerRef.Name) == n.resourceKey() {
+	for i, ownerRef := range child.ownerRefs {
+
+		// backfill UID of inferred owner child references
+		if ownerRef.UID == "" && n.ref.Kind == ownerRef.Kind && n.ref.APIVersion == ownerRef.APIVersion && n.ref.Name == ownerRef.Name {
+			ownerRef.UID = n.ref.UID
+			child.ownerRefs[i] = ownerRef
+			return true
+		}
+
+		if n.ref.UID == ownerRef.UID {
 			return true
 		}
 	}
@@ -100,10 +107,11 @@ func (n *node) asResourceNode() appv1.ResourceNode {
 	for _, ownerRef := range n.ownerRefs {
 		ownerGvk := schema.FromAPIVersionAndKind(ownerRef.APIVersion, ownerRef.Kind)
 		ownerKey := kube.NewResourceKey(ownerGvk.Group, ownerRef.Kind, n.ref.Namespace, ownerRef.Name)
-		parentRefs[0] = appv1.ResourceRef{Name: ownerRef.Name, Kind: ownerKey.Kind, Namespace: n.ref.Namespace, Group: ownerKey.Group}
+		parentRefs[0] = appv1.ResourceRef{Name: ownerRef.Name, Kind: ownerKey.Kind, Namespace: n.ref.Namespace, Group: ownerKey.Group, UID: string(ownerRef.UID)}
 	}
 	return appv1.ResourceNode{
 		ResourceRef: appv1.ResourceRef{
+			UID:       string(n.ref.UID),
 			Name:      n.ref.Name,
 			Group:     gv.Group,
 			Version:   gv.Version,
@@ -119,14 +127,14 @@ func (n *node) asResourceNode() appv1.ResourceNode {
 	}
 }
 
-func (n *node) iterateChildren(ns map[kube.ResourceKey]*node, parents map[kube.ResourceKey]bool, action func(child appv1.ResourceNode)) {
+func (n *node) iterateChildren(ns map[kube.ResourceKey]*node, parents map[kube.ResourceKey]bool, action func(child appv1.ResourceNode, appName string)) {
 	for childKey, child := range ns {
 		if n.isParentOf(ns[childKey]) {
 			if parents[childKey] {
 				key := n.resourceKey()
 				log.Warnf("Circular dependency detected. %s is child and parent of %s", childKey.String(), key.String())
 			} else {
-				action(child.asResourceNode())
+				action(child.asResourceNode(), child.getApp(ns))
 				child.iterateChildren(ns, newResourceKeySet(parents, n.resourceKey()), action)
 			}
 		}

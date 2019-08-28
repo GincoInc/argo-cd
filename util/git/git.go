@@ -22,7 +22,11 @@ func removeSuffix(s, suffix string) string {
 	return s
 }
 
-var commitSHARegex = regexp.MustCompile("^[0-9A-Fa-f]{40}$")
+var (
+	commitSHARegex = regexp.MustCompile("^[0-9A-Fa-f]{40}$")
+	sshURLRegex    = regexp.MustCompile("^(ssh://)?([^/@:]*?)@.*")
+	httpsURLRegex  = regexp.MustCompile("^(https://).*")
+)
 
 // IsCommitSHA returns whether or not a string is a 40 character SHA-1
 func IsCommitSHA(sha string) bool {
@@ -47,7 +51,7 @@ func SameURL(leftRepo, rightRepo string) bool {
 // and should not be considered stable from release to release
 func NormalizeGitURL(repo string) string {
 	repo = strings.ToLower(strings.TrimSpace(repo))
-	if IsSSHURL(repo) {
+	if yes, _ := IsSSHURL(repo); yes {
 		repo = ensurePrefix(repo, "ssh://")
 	}
 	repo = removeSuffix(repo, ".git")
@@ -60,13 +64,22 @@ func NormalizeGitURL(repo string) string {
 }
 
 // IsSSHURL returns true if supplied URL is SSH URL
-func IsSSHURL(url string) bool {
-	return strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://")
+func IsSSHURL(url string) (bool, string) {
+	matches := sshURLRegex.FindStringSubmatch(url)
+	if len(matches) > 2 {
+		return true, matches[2]
+	}
+	return false, ""
+}
+
+// IsHTTPSURL returns true if supplied URL is HTTPS URL
+func IsHTTPSURL(url string) bool {
+	return httpsURLRegex.MatchString(url)
 }
 
 // TestRepo tests if a repo exists and is accessible with the given credentials
-func TestRepo(repo, username, password string, sshPrivateKey string, insecureIgnoreHostKey bool) error {
-	clnt, err := NewFactory().NewClient(repo, "", username, password, sshPrivateKey, insecureIgnoreHostKey)
+func TestRepo(repo string, creds Creds, insecure bool, enableLfs bool) error {
+	clnt, err := NewFactory().NewClient(repo, "", creds, insecure, enableLfs)
 	if err != nil {
 		return err
 	}

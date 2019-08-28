@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"google.golang.org/grpc/metadata"
+
+	"github.com/dgrijalva/jwt-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,9 +18,9 @@ import (
 
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/pkg/apiclient"
+	applicationpkg "github.com/argoproj/argo-cd/pkg/apiclient/application"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	apps "github.com/argoproj/argo-cd/pkg/client/clientset/versioned/fake"
-	"github.com/argoproj/argo-cd/server/application"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
 	"github.com/argoproj/argo-cd/test"
 	"github.com/argoproj/argo-cd/util/assets"
@@ -328,15 +330,24 @@ func TestRevokedToken(t *testing.T) {
 	assert.False(t, s.enf.Enforce(claims, "applications", "get", defaultTestObject))
 }
 
+func TestCertsAreNotGeneratedInInsecureMode(t *testing.T) {
+	s := fakeServer()
+	assert.True(t, s.Insecure)
+	assert.Nil(t, s.settings.Certificate)
+}
+
 func TestUserAgent(t *testing.T) {
 	s := fakeServer()
 	cancelInformer := test.StartInformer(s.projInformer)
 	defer cancelInformer()
 	port, err := test.GetFreePort()
 	assert.NoError(t, err)
+	metricsPort, err := test.GetFreePort()
+	assert.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go s.Run(ctx, port)
+	go s.Run(ctx, port, metricsPort)
+	defer func() { time.Sleep(3 * time.Second) }()
 
 	err = test.WaitForPortListen(fmt.Sprintf("127.0.0.1:%d", port), 10*time.Second)
 	assert.NoError(t, err)
@@ -383,7 +394,7 @@ func TestUserAgent(t *testing.T) {
 		clnt, err := apiclient.NewClient(&opts)
 		assert.NoError(t, err)
 		conn, appClnt := clnt.NewApplicationClientOrDie()
-		_, err = appClnt.List(ctx, &application.ApplicationQuery{})
+		_, err = appClnt.List(ctx, &applicationpkg.ApplicationQuery{})
 		if test.errorMsg != "" {
 			assert.Error(t, err)
 			assert.Regexp(t, test.errorMsg, err.Error())
@@ -391,5 +402,62 @@ func TestUserAgent(t *testing.T) {
 			assert.NoError(t, err)
 		}
 		_ = conn.Close()
+	}
+}
+
+func TestAuthenticate(t *testing.T) {
+	type testData struct {
+		test             string
+		user             string
+		errorMsg         string
+		anonymousEnabled bool
+	}
+	var tests = []testData{
+		{
+			test:             "TestNoSessionAnonymousDisabled",
+			errorMsg:         "no session information",
+			anonymousEnabled: false,
+		},
+		{
+			test:             "TestSessionPresent",
+			user:             "admin",
+			anonymousEnabled: false,
+		},
+		{
+			test:             "TestSessionNotPresentAnonymousEnabled",
+			anonymousEnabled: true,
+		},
+	}
+
+	for _, testData := range tests {
+		t.Run(testData.test, func(t *testing.T) {
+			cm := test.NewFakeConfigMap()
+			if testData.anonymousEnabled {
+				cm.Data["users.anonymous.enabled"] = "true"
+			}
+			secret := test.NewFakeSecret()
+			kubeclientset := fake.NewSimpleClientset(cm, secret)
+			appClientSet := apps.NewSimpleClientset()
+			argoCDOpts := ArgoCDServerOpts{
+				Namespace:     test.FakeArgoCDNamespace,
+				KubeClientset: kubeclientset,
+				AppClientset:  appClientSet,
+			}
+			argocd := NewServer(context.Background(), argoCDOpts)
+			ctx := context.Background()
+			if testData.user != "" {
+				token, err := argocd.sessionMgr.Create("admin", 0)
+				assert.NoError(t, err)
+				ctx = metadata.NewIncomingContext(context.Background(), metadata.Pairs(apiclient.MetaDataTokenKey, token))
+			}
+
+			_, err := argocd.authenticate(ctx)
+			if testData.errorMsg != "" {
+				assert.Errorf(t, err, testData.errorMsg)
+			} else {
+				assert.NoError(t, err)
+			}
+
+		})
 	}
 }

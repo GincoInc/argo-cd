@@ -16,12 +16,11 @@ import (
 	// load the oidc plugin (required to authenticate with OpenID Connect).
 	_ "k8s.io/client-go/plugin/pkg/client/auth/oidc"
 
-	argocd "github.com/argoproj/argo-cd"
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/controller"
 	"github.com/argoproj/argo-cd/errors"
 	appclientset "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
-	"github.com/argoproj/argo-cd/reposerver"
+	"github.com/argoproj/argo-cd/reposerver/apiclient"
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/cli"
 	"github.com/argoproj/argo-cd/util/settings"
@@ -37,14 +36,17 @@ const (
 
 func newCommand() *cobra.Command {
 	var (
-		clientConfig        clientcmd.ClientConfig
-		appResyncPeriod     int64
-		repoServerAddress   string
-		statusProcessors    int
-		operationProcessors int
-		logLevel            string
-		glogLevel           int
-		cacheSrc            func() (*cache.Cache, error)
+		clientConfig             clientcmd.ClientConfig
+		appResyncPeriod          int64
+		repoServerAddress        string
+		repoServerTimeoutSeconds int
+		selfHealTimeoutSeconds   int
+		statusProcessors         int
+		operationProcessors      int
+		logLevel                 string
+		glogLevel                int
+		metricsPort              int
+		cacheSrc                 func() (*cache.Cache, error)
 	)
 	var command = cobra.Command{
 		Use:   cliName,
@@ -54,9 +56,9 @@ func newCommand() *cobra.Command {
 			cli.SetGLogLevel(glogLevel)
 
 			config, err := clientConfig.ClientConfig()
+			errors.CheckError(err)
 			config.QPS = common.K8sClientConfigQPS
 			config.Burst = common.K8sClientConfigBurst
-			errors.CheckError(err)
 
 			kubeClient := kubernetes.NewForConfigOrDie(config)
 			appClient := appclientset.NewForConfigOrDie(config)
@@ -65,7 +67,7 @@ func newCommand() *cobra.Command {
 			errors.CheckError(err)
 
 			resyncDuration := time.Duration(appResyncPeriod) * time.Second
-			repoClientset := reposerver.NewRepoServerClientset(repoServerAddress)
+			repoClientset := apiclient.NewRepoServerClientset(repoServerAddress, repoServerTimeoutSeconds)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 
@@ -80,10 +82,12 @@ func newCommand() *cobra.Command {
 				appClient,
 				repoClientset,
 				cache,
-				resyncDuration)
+				resyncDuration,
+				time.Duration(selfHealTimeoutSeconds)*time.Second,
+				metricsPort)
 			errors.CheckError(err)
 
-			log.Infof("Application Controller (version: %s) starting (namespace: %s)", argocd.GetVersion(), namespace)
+			log.Infof("Application Controller (version: %s) starting (namespace: %s)", common.GetVersion(), namespace)
 			stats.RegisterStackDumper()
 			stats.StartStatsTicker(10 * time.Minute)
 			stats.RegisterHeapDumper("memprofile")
@@ -98,10 +102,14 @@ func newCommand() *cobra.Command {
 	clientConfig = cli.AddKubectlFlagsToCmd(&command)
 	command.Flags().Int64Var(&appResyncPeriod, "app-resync", defaultAppResyncPeriod, "Time period in seconds for application resync.")
 	command.Flags().StringVar(&repoServerAddress, "repo-server", common.DefaultRepoServerAddr, "Repo server address.")
+	command.Flags().IntVar(&repoServerTimeoutSeconds, "repo-server-timeout-seconds", 60, "Repo server RPC call timeout seconds.")
 	command.Flags().IntVar(&statusProcessors, "status-processors", 1, "Number of application status processors")
 	command.Flags().IntVar(&operationProcessors, "operation-processors", 1, "Number of application operation processors")
 	command.Flags().StringVar(&logLevel, "loglevel", "info", "Set the logging level. One of: debug|info|warn|error")
 	command.Flags().IntVar(&glogLevel, "gloglevel", 0, "Set the glog logging level")
+	command.Flags().IntVar(&metricsPort, "metrics-port", common.DefaultPortArgoCDMetrics, "Start metrics server on given port")
+	command.Flags().IntVar(&selfHealTimeoutSeconds, "self-heal-timeout-seconds", 5, "Specifies timeout between application self heal attempts")
+
 	cacheSrc = cache.AddCacheFlagsToCmd(&command)
 	return &command
 }

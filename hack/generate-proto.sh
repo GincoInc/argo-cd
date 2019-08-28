@@ -9,6 +9,11 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+# output tool versions
+protoc --version
+swagger version
+jq --version
+
 PROJECT_ROOT=$(cd $(dirname ${BASH_SOURCE})/..; pwd)
 CODEGEN_PKG=${CODEGEN_PKG:-$(cd ${PROJECT_ROOT}; ls -d -1 ./vendor/k8s.io/code-generator 2>/dev/null || echo ../code-generator)}
 PATH="${PROJECT_ROOT}/dist:${PATH}"
@@ -58,17 +63,10 @@ go build -i -o dist/protoc-gen-grpc-gateway ./vendor/github.com/grpc-ecosystem/g
 go build -i -o dist/protoc-gen-swagger ./vendor/github.com/grpc-ecosystem/grpc-gateway/protoc-gen-swagger
 
 # Generate server/<service>/(<service>.pb.go|<service>.pb.gw.go)
-PROTO_FILES=$(find $PROJECT_ROOT \( -name "*.proto" -and -path '*/server/*' -or -path '*/reposerver/*' -and -name "*.proto" \))
+PROTO_FILES=$(find $PROJECT_ROOT \( -name "*.proto" -and -path '*/server/*' -or -path '*/reposerver/*' -and -name "*.proto" \) | sort)
 for i in ${PROTO_FILES}; do
-    # Path to the google API gateway annotations.proto will be different depending if we are
-    # building natively (e.g. from workspace) vs. part of a docker build.
-    if [ -f /.dockerenv ]; then
-        GOOGLE_PROTO_API_PATH=$GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
-        GOGO_PROTOBUF_PATH=$GOPATH/src/github.com/gogo/protobuf
-    else
-        GOOGLE_PROTO_API_PATH=${PROJECT_ROOT}/vendor/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
-        GOGO_PROTOBUF_PATH=${PROJECT_ROOT}/vendor/github.com/gogo/protobuf
-    fi
+    GOOGLE_PROTO_API_PATH=${PROJECT_ROOT}/vendor/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis
+    GOGO_PROTOBUF_PATH=${PROJECT_ROOT}/vendor/github.com/gogo/protobuf
     protoc \
         -I${PROJECT_ROOT} \
         -I/usr/local/include \
@@ -116,7 +114,7 @@ clean_swagger() {
     /usr/bin/find "${SWAGGER_ROOT}" -name '*.swagger.json' -delete
 }
 
-collect_swagger server 24
+collect_swagger server 26
 clean_swagger server
 clean_swagger reposerver
 clean_swagger controller

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go"
 	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -19,12 +19,13 @@ import (
 
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/errors"
+	"github.com/argoproj/argo-cd/pkg/apiclient/application"
 	appsv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	apps "github.com/argoproj/argo-cd/pkg/client/clientset/versioned/fake"
 	appinformer "github.com/argoproj/argo-cd/pkg/client/informers/externalversions"
+	"github.com/argoproj/argo-cd/reposerver/apiclient"
+	"github.com/argoproj/argo-cd/reposerver/apiclient/mocks"
 	mockrepo "github.com/argoproj/argo-cd/reposerver/mocks"
-	"github.com/argoproj/argo-cd/reposerver/repository"
-	mockreposerver "github.com/argoproj/argo-cd/reposerver/repository/mocks"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
 	"github.com/argoproj/argo-cd/test"
 	"github.com/argoproj/argo-cd/util"
@@ -60,8 +61,8 @@ func fakeCluster() *appsv1.Cluster {
 	}
 }
 
-func fakeFileResponse() *repository.GetFileResponse {
-	return &repository.GetFileResponse{
+func fakeFileResponse() *apiclient.GetFileResponse {
+	return &apiclient.GetFileResponse{
 		Data: []byte(`
 apiVersion: 0.1.0
 environments:
@@ -78,8 +79,8 @@ version: 0.0.1
 	}
 }
 
-func fakeListDirResponse() *repository.FileList {
-	return &repository.FileList{
+func fakeListDirResponse() *apiclient.FileList {
+	return &apiclient.FileList{
 		Items: []string{
 			"some/path/app.yaml",
 		},
@@ -89,7 +90,13 @@ func fakeListDirResponse() *repository.FileList {
 // return an ApplicationServiceServer which returns fake data
 func newTestAppServer(objects ...runtime.Object) *Server {
 	kubeclientset := fake.NewSimpleClientset(&v1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Namespace: testNamespace, Name: "argocd-cm"},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: testNamespace,
+			Name:      "argocd-cm",
+			Labels: map[string]string{
+				"app.kubernetes.io/part-of": "argocd",
+			},
+		},
 	}, &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "argocd-secret",
@@ -107,10 +114,10 @@ func newTestAppServer(objects ...runtime.Object) *Server {
 	_, err = db.CreateCluster(ctx, fakeCluster())
 	errors.CheckError(err)
 
-	mockRepoServiceClient := mockreposerver.RepoServerServiceClient{}
+	mockRepoServiceClient := mocks.RepoServerServiceClient{}
 	mockRepoServiceClient.On("GetFile", mock.Anything, mock.Anything).Return(fakeFileResponse(), nil)
 	mockRepoServiceClient.On("ListDir", mock.Anything, mock.Anything).Return(fakeListDirResponse(), nil)
-	mockRepoServiceClient.On("GenerateManifest", mock.Anything, mock.Anything).Return(&repository.ManifestResponse{}, nil)
+	mockRepoServiceClient.On("GenerateManifest", mock.Anything, mock.Anything).Return(&apiclient.ManifestResponse{}, nil)
 
 	mockRepoClient := &mockrepo.Clientset{}
 	mockRepoClient.On("NewRepoServerClient").Return(&fakeCloser{}, &mockRepoServiceClient, nil)
@@ -166,7 +173,7 @@ metadata:
 spec:
   source:
     path: some/path
-    repoURL: https://git.com/repo.git
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
     targetRevision: HEAD
     ksonnet:
       environment: default
@@ -188,7 +195,7 @@ func TestCreateApp(t *testing.T) {
 	testApp := newTestApp()
 	appServer := newTestAppServer()
 	testApp.Spec.Project = ""
-	createReq := ApplicationCreateRequest{
+	createReq := application.ApplicationCreateRequest{
 		Application: *testApp,
 	}
 	app, err := appServer.Create(context.Background(), &createReq)
@@ -200,7 +207,7 @@ func TestUpdateApp(t *testing.T) {
 	testApp := newTestApp()
 	appServer := newTestAppServer(testApp)
 	testApp.Spec.Project = ""
-	app, err := appServer.Update(context.Background(), &ApplicationUpdateRequest{
+	app, err := appServer.Update(context.Background(), &application.ApplicationUpdateRequest{
 		Application: testApp,
 	})
 	assert.Nil(t, err)
@@ -211,13 +218,13 @@ func TestUpdateAppSpec(t *testing.T) {
 	testApp := newTestApp()
 	appServer := newTestAppServer(testApp)
 	testApp.Spec.Project = ""
-	spec, err := appServer.UpdateSpec(context.Background(), &ApplicationUpdateSpecRequest{
+	spec, err := appServer.UpdateSpec(context.Background(), &application.ApplicationUpdateSpecRequest{
 		Name: &testApp.Name,
 		Spec: testApp.Spec,
 	})
 	assert.NoError(t, err)
 	assert.Equal(t, "default", spec.Project)
-	app, err := appServer.Get(context.Background(), &ApplicationQuery{Name: &testApp.Name})
+	app, err := appServer.Get(context.Background(), &application.ApplicationQuery{Name: &testApp.Name})
 	assert.NoError(t, err)
 	assert.Equal(t, "default", app.Spec.Project)
 }
@@ -225,13 +232,13 @@ func TestUpdateAppSpec(t *testing.T) {
 func TestDeleteApp(t *testing.T) {
 	ctx := context.Background()
 	appServer := newTestAppServer()
-	createReq := ApplicationCreateRequest{
+	createReq := application.ApplicationCreateRequest{
 		Application: *newTestApp(),
 	}
 	app, err := appServer.Create(ctx, &createReq)
 	assert.Nil(t, err)
 
-	app, err = appServer.Get(ctx, &ApplicationQuery{Name: &app.Name})
+	app, err = appServer.Get(ctx, &application.ApplicationQuery{Name: &app.Name})
 	assert.Nil(t, err)
 	assert.NotNil(t, app)
 
@@ -251,7 +258,7 @@ func TestDeleteApp(t *testing.T) {
 	appServer.appclientset = fakeAppCs
 
 	trueVar := true
-	_, err = appServer.Delete(ctx, &ApplicationDeleteRequest{Name: &app.Name, Cascade: &trueVar})
+	_, err = appServer.Delete(ctx, &application.ApplicationDeleteRequest{Name: &app.Name, Cascade: &trueVar})
 	assert.Nil(t, err)
 	assert.True(t, patched)
 	assert.True(t, deleted)
@@ -260,7 +267,7 @@ func TestDeleteApp(t *testing.T) {
 	falseVar := false
 	patched = false
 	deleted = false
-	_, err = appServer.Delete(ctx, &ApplicationDeleteRequest{Name: &app.Name, Cascade: &falseVar})
+	_, err = appServer.Delete(ctx, &application.ApplicationDeleteRequest{Name: &app.Name, Cascade: &falseVar})
 	assert.Nil(t, err)
 	assert.False(t, patched)
 	assert.True(t, deleted)
@@ -271,13 +278,13 @@ func TestSyncAndTerminate(t *testing.T) {
 	appServer := newTestAppServer()
 	testApp := newTestApp()
 	testApp.Spec.Source.RepoURL = "https://github.com/argoproj/argo-cd.git"
-	createReq := ApplicationCreateRequest{
+	createReq := application.ApplicationCreateRequest{
 		Application: *testApp,
 	}
 	app, err := appServer.Create(ctx, &createReq)
 	assert.Nil(t, err)
 
-	app, err = appServer.Sync(ctx, &ApplicationSyncRequest{Name: &app.Name})
+	app, err = appServer.Sync(ctx, &application.ApplicationSyncRequest{Name: &app.Name})
 	assert.Nil(t, err)
 	assert.NotNil(t, app)
 	assert.NotNil(t, app.Operation)
@@ -297,11 +304,11 @@ func TestSyncAndTerminate(t *testing.T) {
 	_, err = appServer.appclientset.ArgoprojV1alpha1().Applications(appServer.ns).Update(app)
 	assert.Nil(t, err)
 
-	resp, err := appServer.TerminateOperation(ctx, &OperationTerminateRequest{Name: &app.Name})
+	resp, err := appServer.TerminateOperation(ctx, &application.OperationTerminateRequest{Name: &app.Name})
 	assert.Nil(t, err)
 	assert.NotNil(t, resp)
 
-	app, err = appServer.Get(ctx, &ApplicationQuery{Name: &app.Name})
+	app, err = appServer.Get(ctx, &application.ApplicationQuery{Name: &app.Name})
 	assert.Nil(t, err)
 	assert.NotNil(t, app)
 	assert.Equal(t, appsv1.OperationTerminating, app.Status.OperationState.Phase)
@@ -316,7 +323,7 @@ func TestRollbackApp(t *testing.T) {
 	}}
 	appServer := newTestAppServer(testApp)
 
-	updatedApp, err := appServer.Rollback(context.Background(), &ApplicationRollbackRequest{
+	updatedApp, err := appServer.Rollback(context.Background(), &application.ApplicationRollbackRequest{
 		Name: &testApp.Name,
 		ID:   1,
 	})
@@ -338,12 +345,12 @@ func TestUpdateAppProject(t *testing.T) {
 
 	// Verify normal update works (without changing project)
 	_ = appServer.enf.SetBuiltinPolicy(`p, admin, applications, update, default/test-app, allow`)
-	_, err := appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	_, err := appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.NoError(t, err)
 
 	// Verify caller cannot update to another project
 	testApp.Spec.Project = "my-proj"
-	_, err = appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	_, err = appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.Equal(t, status.Code(err), codes.PermissionDenied)
 
 	// Verify inability to change projects without create privileges in new project
@@ -351,7 +358,7 @@ func TestUpdateAppProject(t *testing.T) {
 p, admin, applications, update, default/test-app, allow
 p, admin, applications, update, my-proj/test-app, allow
 `)
-	_, err = appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	_, err = appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.Equal(t, status.Code(err), codes.PermissionDenied)
 
 	// Verify inability to change projects without update privileges in new project
@@ -359,7 +366,7 @@ p, admin, applications, update, my-proj/test-app, allow
 p, admin, applications, update, default/test-app, allow
 p, admin, applications, create, my-proj/test-app, allow
 `)
-	_, err = appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	_, err = appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.Equal(t, status.Code(err), codes.PermissionDenied)
 
 	// Verify inability to change projects without update privileges in old project
@@ -367,7 +374,7 @@ p, admin, applications, create, my-proj/test-app, allow
 p, admin, applications, create, my-proj/test-app, allow
 p, admin, applications, update, my-proj/test-app, allow
 `)
-	_, err = appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	_, err = appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.Equal(t, status.Code(err), codes.PermissionDenied)
 
 	// Verify can update project with proper permissions
@@ -376,27 +383,40 @@ p, admin, applications, update, default/test-app, allow
 p, admin, applications, create, my-proj/test-app, allow
 p, admin, applications, update, my-proj/test-app, allow
 `)
-	updatedApp, err := appServer.Update(ctx, &ApplicationUpdateRequest{Application: testApp})
+	updatedApp, err := appServer.Update(ctx, &application.ApplicationUpdateRequest{Application: testApp})
 	assert.NoError(t, err)
 	assert.Equal(t, "my-proj", updatedApp.Spec.Project)
 }
 
-func TestPatch(t *testing.T) {
+func TestAppJsonPatch(t *testing.T) {
 	testApp := newTestApp()
 	ctx := context.Background()
 	ctx = context.WithValue(ctx, "claims", &jwt.StandardClaims{Subject: "admin"})
 	appServer := newTestAppServer(testApp)
 	appServer.enf.SetDefaultRole("")
 
-	app, err := appServer.Patch(ctx, &ApplicationPatchRequest{Name: &testApp.Name, Patch: "garbage"})
+	app, err := appServer.Patch(ctx, &application.ApplicationPatchRequest{Name: &testApp.Name, Patch: "garbage"})
 	assert.Error(t, err)
 	assert.Nil(t, app)
 
-	app, err = appServer.Patch(ctx, &ApplicationPatchRequest{Name: &testApp.Name, Patch: "[]"})
+	app, err = appServer.Patch(ctx, &application.ApplicationPatchRequest{Name: &testApp.Name, Patch: "[]"})
 	assert.NoError(t, err)
 	assert.NotNil(t, app)
 
-	app, err = appServer.Patch(ctx, &ApplicationPatchRequest{Name: &testApp.Name, Patch: `[{"op": "replace", "path": "/spec/source/path", "value": "foo"}]`})
+	app, err = appServer.Patch(ctx, &application.ApplicationPatchRequest{Name: &testApp.Name, Patch: `[{"op": "replace", "path": "/spec/source/path", "value": "foo"}]`})
+	assert.NoError(t, err)
+	assert.Equal(t, "foo", app.Spec.Source.Path)
+}
+
+func TestAppMergePatch(t *testing.T) {
+	testApp := newTestApp()
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, "claims", &jwt.StandardClaims{Subject: "admin"})
+	appServer := newTestAppServer(testApp)
+	appServer.enf.SetDefaultRole("")
+
+	app, err := appServer.Patch(ctx, &application.ApplicationPatchRequest{
+		Name: &testApp.Name, Patch: `{"spec": { "source": { "path": "foo" } }}`, PatchType: "merge"})
 	assert.NoError(t, err)
 	assert.Equal(t, "foo", app.Spec.Source.Path)
 }

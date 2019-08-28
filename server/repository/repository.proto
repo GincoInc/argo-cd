@@ -1,5 +1,5 @@
 syntax = "proto3";
-option go_package = "github.com/argoproj/argo-cd/server/repository";
+option go_package = "github.com/argoproj/argo-cd/pkg/apiclient/repository";
 
 // Repository Service
 //
@@ -42,6 +42,24 @@ message RepoAppsResponse {
 // RepoQuery is a query for Repository resources
 message RepoQuery {
 	string repo = 1;
+}
+
+// RepoAccessQuery is a query for checking access to a repo
+message RepoAccessQuery {
+	// The URL to the repo
+	string repo = 1;
+	// Username for accessing repo
+	string username = 2;
+	// Password for accessing repo
+	string password = 3;
+	// Private key data for accessing SSH repository
+	string sshPrivateKey = 4;
+	// Whether to skip certificate or host key validation
+	bool   insecure = 5;
+	// TLS client cert data for accessing HTTPS repository
+	string tlsClientCertData = 6;
+	// TLS client cert key for accessing HTTPS repository
+	string tlsClientCertKey = 7;
 }
 
 message RepoResponse {}
@@ -92,6 +110,14 @@ service RepositoryService {
 	// Delete deletes a repo
 	rpc Delete(RepoQuery) returns (RepoResponse) {
 		option (google.api.http).delete = "/api/v1/repositories/{repo}";
+	}
+
+	// ValidateAccess validates access to a repository with given parameters
+	rpc ValidateAccess(RepoAccessQuery) returns (RepoResponse) {
+		option (google.api.http) = {
+			post: "/api/v1/repositories/{repo}/validate"
+			body: "repo"
+		};
 	}
 
 }

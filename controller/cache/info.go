@@ -9,12 +9,18 @@ import (
 	k8snode "k8s.io/kubernetes/pkg/util/node"
 
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/kube"
+	"github.com/argoproj/argo-cd/util/resource"
 )
 
 func populateNodeInfo(un *unstructured.Unstructured, node *node) {
 
 	gvk := un.GroupVersionKind()
+	revision := resource.GetRevision(un)
+	if revision > 0 {
+		node.info = append(node.info, v1alpha1.InfoItem{Name: "Revision", Value: fmt.Sprintf("Rev:%v", revision)})
+	}
 	switch gvk.Group {
 	case "":
 		switch gvk.Kind {
@@ -32,7 +38,6 @@ func populateNodeInfo(un *unstructured.Unstructured, node *node) {
 			return
 		}
 	}
-	node.info = []v1alpha1.InfoItem{}
 }
 
 func getIngress(un *unstructured.Unstructured) []v1.LoadBalancerIngress {
@@ -63,20 +68,31 @@ func populateServiceInfo(un *unstructured.Unstructured, node *node) {
 }
 
 func populateIngressInfo(un *unstructured.Unstructured, node *node) {
-	targets := make([]v1alpha1.ResourceRef, 0)
+	ingress := getIngress(un)
+	targetsMap := make(map[v1alpha1.ResourceRef]bool)
 	if backend, ok, err := unstructured.NestedMap(un.Object, "spec", "backend"); ok && err == nil {
-		targets = append(targets, v1alpha1.ResourceRef{
+		targetsMap[v1alpha1.ResourceRef{
 			Group:     "",
 			Kind:      kube.ServiceKind,
 			Namespace: un.GetNamespace(),
 			Name:      fmt.Sprintf("%s", backend["serviceName"]),
-		})
+		}] = true
 	}
+	urlsSet := make(map[string]bool)
 	if rules, ok, err := unstructured.NestedSlice(un.Object, "spec", "rules"); ok && err == nil {
 		for i := range rules {
 			rule, ok := rules[i].(map[string]interface{})
 			if !ok {
 				continue
+			}
+			host := rule["host"]
+			if host == nil || host == "" {
+				for i := range ingress {
+					host = util.FirstNonEmpty(ingress[i].Hostname, ingress[i].IP)
+					if host != "" {
+						break
+					}
+				}
 			}
 			paths, ok, err := unstructured.NestedSlice(rule, "http", "paths")
 			if !ok || err != nil {
@@ -87,25 +103,65 @@ func populateIngressInfo(un *unstructured.Unstructured, node *node) {
 				if !ok {
 					continue
 				}
+
 				if serviceName, ok, err := unstructured.NestedString(path, "backend", "serviceName"); ok && err == nil {
-					targets = append(targets, v1alpha1.ResourceRef{
+					targetsMap[v1alpha1.ResourceRef{
 						Group:     "",
 						Kind:      kube.ServiceKind,
 						Namespace: un.GetNamespace(),
 						Name:      serviceName,
-					})
+					}] = true
+				}
+
+				if port, ok, err := unstructured.NestedFieldNoCopy(path, "backend", "servicePort"); ok && err == nil && host != "" && host != nil {
+					stringPort := ""
+					switch typedPod := port.(type) {
+					case int64:
+						stringPort = fmt.Sprintf("%d", typedPod)
+					case float64:
+						stringPort = fmt.Sprintf("%d", int64(typedPod))
+					case string:
+						stringPort = typedPod
+					default:
+						stringPort = fmt.Sprintf("%v", port)
+					}
+
+					var externalURL string
+					switch stringPort {
+					case "80", "http":
+						externalURL = fmt.Sprintf("http://%s", host)
+					case "443", "https":
+						externalURL = fmt.Sprintf("https://%s", host)
+					default:
+						externalURL = fmt.Sprintf("http://%s:%s", host, stringPort)
+					}
+
+					subPath := ""
+					if nestedPath, ok, err := unstructured.NestedString(path, "path"); ok && err == nil {
+						subPath = nestedPath
+					}
+
+					externalURL += subPath
+					urlsSet[externalURL] = true
 				}
 			}
 		}
 	}
-	node.networkingInfo = &v1alpha1.ResourceNetworkingInfo{TargetRefs: targets, Ingress: getIngress(un)}
+	targets := make([]v1alpha1.ResourceRef, 0)
+	for target := range targetsMap {
+		targets = append(targets, target)
+	}
+	urls := make([]string, 0)
+	for url := range urlsSet {
+		urls = append(urls, url)
+	}
+	node.networkingInfo = &v1alpha1.ResourceNetworkingInfo{TargetRefs: targets, Ingress: ingress, ExternalURLs: urls}
 }
 
 func populatePodInfo(un *unstructured.Unstructured, node *node) {
 	pod := v1.Pod{}
 	err := runtime.DefaultUnstructuredConverter.FromUnstructured(un.Object, &pod)
 	if err != nil {
-		node.info = []v1alpha1.InfoItem{}
 		return
 	}
 	restarts := 0
@@ -117,13 +173,20 @@ func populatePodInfo(un *unstructured.Unstructured, node *node) {
 		reason = pod.Status.Reason
 	}
 
-	initializing := false
-
-	// note that I ignore initContainers
+	imagesSet := make(map[string]bool)
+	for _, container := range pod.Spec.InitContainers {
+		imagesSet[container.Image] = true
+	}
 	for _, container := range pod.Spec.Containers {
-		node.images = append(node.images, container.Image)
+		imagesSet[container.Image] = true
 	}
 
+	node.images = nil
+	for image := range imagesSet {
+		node.images = append(node.images, image)
+	}
+
+	initializing := false
 	for i := range pod.Status.InitContainerStatuses {
 		container := pod.Status.InitContainerStatuses[i]
 		restarts += int(container.RestartCount)
@@ -186,7 +249,6 @@ func populatePodInfo(un *unstructured.Unstructured, node *node) {
 		reason = "Terminating"
 	}
 
-	node.info = make([]v1alpha1.InfoItem, 0)
 	if reason != "" {
 		node.info = append(node.info, v1alpha1.InfoItem{Name: "Status Reason", Value: reason})
 	}

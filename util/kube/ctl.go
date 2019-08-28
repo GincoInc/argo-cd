@@ -8,8 +8,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Masterminds/semver"
-	"github.com/pkg/errors"
+	argoexec "github.com/argoproj/pkg/exec"
 	log "github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,15 +20,12 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/argoproj/argo-cd/util"
+	"github.com/argoproj/argo-cd/util/config"
 	"github.com/argoproj/argo-cd/util/diff"
 )
 
-var (
-	ingressDeprecationVersion = semver.MustParse("v1.14.0")
-)
-
 type Kubectl interface {
-	ApplyResource(config *rest.Config, obj *unstructured.Unstructured, namespace string, dryRun, force bool) (string, error)
+	ApplyResource(config *rest.Config, obj *unstructured.Unstructured, namespace string, dryRun, force, validate bool) (string, error)
 	ConvertToVersion(obj *unstructured.Unstructured, group, version string) (*unstructured.Unstructured, error)
 	DeleteResource(config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string, forceDelete bool) error
 	GetResource(config *rest.Config, gvk schema.GroupVersionKind, name string, namespace string) (*unstructured.Unstructured, error)
@@ -57,14 +53,6 @@ func filterAPIResources(config *rest.Config, resourceFilter ResourceFilter, filt
 	if err != nil {
 		return nil, err
 	}
-	versionInfo, err := disco.ServerVersion()
-	if err != nil {
-		return nil, err
-	}
-	version, err := semver.NewVersion(versionInfo.String())
-	if err != nil {
-		return nil, err
-	}
 
 	serverResources, err := disco.ServerPreferredResources()
 	if err != nil {
@@ -80,14 +68,11 @@ func filterAPIResources(config *rest.Config, resourceFilter ResourceFilter, filt
 			gv = schema.GroupVersion{}
 		}
 		for _, apiResource := range apiResourcesList.APIResources {
+
 			if resourceFilter.IsExcludedResource(gv.Group, apiResource.Kind, config.Host) {
 				continue
 			}
-			if _, ok := isObsoleteExtensionsGroupKind(gv.Group, apiResource.Kind); ok &&
-				// Edge case for deprecated Ingress kind.
-				!(gv.Group == "extensions" && apiResource.Kind == IngressKind && version.LessThan(ingressDeprecationVersion)) {
-				continue
-			}
+
 			if filter(&apiResource) {
 				resource := ToGroupVersionResource(apiResourcesList.GroupVersion, &apiResource)
 				resourceIf := ToResourceInterface(dynamicIf, &apiResource, resource, namespace)
@@ -162,7 +147,7 @@ func (k KubectlCmd) PatchResource(config *rest.Config, gvk schema.GroupVersionKi
 	}
 	resource := gvk.GroupVersion().WithResource(apiResource.Name)
 	resourceIf := ToResourceInterface(dynamicIf, apiResource, resource, namespace)
-	return resourceIf.Patch(name, patchType, patchBytes, metav1.UpdateOptions{})
+	return resourceIf.Patch(name, patchType, patchBytes, metav1.PatchOptions{})
 }
 
 // DeleteResource deletes resource
@@ -193,7 +178,7 @@ func (k KubectlCmd) DeleteResource(config *rest.Config, gvk schema.GroupVersionK
 }
 
 // ApplyResource performs an apply of a unstructured resource
-func (k KubectlCmd) ApplyResource(config *rest.Config, obj *unstructured.Unstructured, namespace string, dryRun, force bool) (string, error) {
+func (k KubectlCmd) ApplyResource(config *rest.Config, obj *unstructured.Unstructured, namespace string, dryRun, force, validate bool) (string, error) {
 	log.Infof("Applying resource %s/%s in cluster: %s, namespace: %s", obj.GetKind(), obj.GetName(), config.Host, namespace)
 	f, err := ioutil.TempFile(util.TempDir, "")
 	if err != nil {
@@ -243,12 +228,27 @@ func (k KubectlCmd) ApplyResource(config *rest.Config, obj *unstructured.Unstruc
 	if force {
 		applyArgs = append(applyArgs, "--force")
 	}
+	if !validate {
+		applyArgs = append(applyArgs, "--validate=false")
+	}
 	outApply, err := runKubectl(f.Name(), namespace, applyArgs, manifestBytes, dryRun)
 	if err != nil {
 		return "", err
 	}
 	out = append(out, outApply)
 	return strings.Join(out, ". "), nil
+}
+
+func convertKubectlError(err error) error {
+	errorStr := err.Error()
+	if cmdErr, ok := err.(*argoexec.CmdError); ok {
+		parts := []string{fmt.Sprintf("kubectl failed %s", cmdErr.Cause.Error())}
+		if cmdErr.Stderr != "" {
+			parts = append(parts, cleanKubectlOutput(cmdErr.Stderr))
+		}
+		errorStr = strings.Join(parts, ": ")
+	}
+	return fmt.Errorf(errorStr)
 }
 
 func runKubectl(kubeconfigPath string, namespace string, args []string, manifestBytes []byte, dryRun bool) (string, error) {
@@ -260,7 +260,6 @@ func runKubectl(kubeconfigPath string, namespace string, args []string, manifest
 		cmdArgs = append(cmdArgs, "--dry-run")
 	}
 	cmd := exec.Command("kubectl", cmdArgs...)
-	log.Info(cmd.Args)
 	if log.IsLevelEnabled(log.DebugLevel) {
 		var obj unstructured.Unstructured
 		err := json.Unmarshal(manifestBytes, &obj)
@@ -278,15 +277,11 @@ func runKubectl(kubeconfigPath string, namespace string, args []string, manifest
 		log.Debug(string(redactedBytes))
 	}
 	cmd.Stdin = bytes.NewReader(manifestBytes)
-	out, err := cmd.Output()
+	out, err := argoexec.RunCommandExt(cmd, config.CmdOpts())
 	if err != nil {
-		if exErr, ok := err.(*exec.ExitError); ok {
-			errMsg := cleanKubectlOutput(string(exErr.Stderr))
-			return "", errors.New(errMsg)
-		}
-		return "", err
+		return "", convertKubectlError(err)
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out, nil
 }
 
 // ConvertToVersion converts an unstructured object into the specified group/version
@@ -294,18 +289,6 @@ func (k KubectlCmd) ConvertToVersion(obj *unstructured.Unstructured, group strin
 	gvk := obj.GroupVersionKind()
 	if gvk.Group == group && gvk.Version == version {
 		return obj.DeepCopy(), nil
-	}
-	newGroup, isObsoleteKind := obsoleteExtensionsKinds[gvk.Kind]
-
-	// If converting from or to obsolete kind from 'extensions' group when just replace group, version, kind without real conversion.
-	if gvk.Group == "extensions" && isObsoleteKind || isObsoleteKind && group == "extensions" && newGroup == gvk.Group {
-		converted := obj.DeepCopy()
-		converted.SetGroupVersionKind(schema.GroupVersionKind{
-			Kind:    gvk.Kind,
-			Group:   group,
-			Version: version,
-		})
-		return converted, nil
 	}
 
 	manifestBytes, err := json.Marshal(obj)
@@ -324,18 +307,14 @@ func (k KubectlCmd) ConvertToVersion(obj *unstructured.Unstructured, group strin
 	outputVersion := fmt.Sprintf("%s/%s", group, version)
 	cmd := exec.Command("kubectl", "convert", "--output-version", outputVersion, "-o", "json", "--local=true", "-f", f.Name())
 	cmd.Stdin = bytes.NewReader(manifestBytes)
-	out, err := cmd.Output()
+	out, err := argoexec.RunCommandExt(cmd, config.CmdOpts())
 	if err != nil {
-		if exErr, ok := err.(*exec.ExitError); ok {
-			errMsg := cleanKubectlOutput(string(exErr.Stderr))
-			return nil, errors.New(errMsg)
-		}
-		return nil, fmt.Errorf("failed to convert %s/%s to %s/%s", obj.GetKind(), obj.GetName(), group, version)
+		return nil, convertKubectlError(err)
 	}
 	// NOTE: when kubectl convert runs against stdin (i.e. kubectl convert -f -), the output is
 	// a unstructured list instead of an unstructured object
 	var convertedObj unstructured.Unstructured
-	err = json.Unmarshal(out, &convertedObj)
+	err = json.Unmarshal([]byte(out), &convertedObj)
 	if err != nil {
 		return nil, err
 	}

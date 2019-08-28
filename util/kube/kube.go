@@ -3,15 +3,14 @@ package kube
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"reflect"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/ghodss/yaml"
 	log "github.com/sirupsen/logrus"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierr "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,10 +24,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-	"k8s.io/kubernetes/pkg/kubectl/scheme"
 
 	"github.com/argoproj/argo-cd/common"
-	jsonutil "github.com/argoproj/argo-cd/util/json"
 )
 
 const (
@@ -39,6 +36,7 @@ const (
 const (
 	SecretKind                   = "Secret"
 	ServiceKind                  = "Service"
+	ServiceAccountKind           = "ServiceAccount"
 	EndpointsKind                = "Endpoints"
 	DeploymentKind               = "Deployment"
 	ReplicaSetKind               = "ReplicaSet"
@@ -49,20 +47,7 @@ const (
 	PersistentVolumeClaimKind    = "PersistentVolumeClaim"
 	CustomResourceDefinitionKind = "CustomResourceDefinition"
 	PodKind                      = "Pod"
-	NetworkPolicyKind            = "NetworkPolicy"
-	PodSecurityPolicyKind        = "PodSecurityPolicy"
-)
-
-var (
-	// obsoleteExtensionsKinds contains list of obsolete kinds from extensions group and corresponding name of new group
-	obsoleteExtensionsKinds = map[string]string{
-		DaemonSetKind:         "apps",
-		ReplicaSetKind:        "apps",
-		DeploymentKind:        "apps",
-		IngressKind:           "networking.k8s.io",
-		NetworkPolicyKind:     "networking.k8s.io",
-		PodSecurityPolicyKind: "policy",
-	}
+	APIServiceKind               = "APIService"
 )
 
 type ResourceKey struct {
@@ -80,25 +65,23 @@ func (k ResourceKey) GroupKind() schema.GroupKind {
 	return schema.GroupKind{Group: k.Group, Kind: k.Kind}
 }
 
-func isObsoleteExtensionsGroupKind(group string, kind string) (string, bool) {
-	if group == "extensions" {
-		newGroup, ok := obsoleteExtensionsKinds[kind]
-		return newGroup, ok
-	}
-	return "", false
-}
-
 func NewResourceKey(group string, kind string, namespace string, name string) ResourceKey {
-	if newGroup, ok := isObsoleteExtensionsGroupKind(group, kind); ok {
-		group = newGroup
-	}
-
 	return ResourceKey{Group: group, Kind: kind, Namespace: namespace, Name: name}
 }
 
 func GetResourceKey(obj *unstructured.Unstructured) ResourceKey {
 	gvk := obj.GroupVersionKind()
 	return NewResourceKey(gvk.Group, gvk.Kind, obj.GetNamespace(), obj.GetName())
+}
+
+func GetObjectRef(obj *unstructured.Unstructured) v1.ObjectReference {
+	return v1.ObjectReference{
+		UID:        obj.GetUID(),
+		APIVersion: obj.GetAPIVersion(),
+		Kind:       obj.GetKind(),
+		Name:       obj.GetName(),
+		Namespace:  obj.GetNamespace(),
+	}
 }
 
 // TestConfig tests to make sure the REST config is usable
@@ -383,42 +366,9 @@ func SplitYAML(out string) ([]*unstructured.Unstructured, error) {
 			}
 			continue
 		}
-		remObj, err := Remarshal(&obj)
-		if err != nil {
-			log.Debugf("Failed to remarshal oject: %v", err)
-		} else {
-			obj = *remObj
-		}
 		objs = append(objs, &obj)
 	}
 	return objs, firstErr
-}
-
-// Remarshal checks resource kind and version and re-marshal using corresponding struct custom marshaller.
-// This ensures that expected resource state is formatter same as actual resource state in kubernetes
-// and allows to find differences between actual and target states more accurately.
-func Remarshal(obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
-	data, err := json.Marshal(obj)
-	if err != nil {
-		return nil, err
-	}
-	item, err := scheme.Scheme.New(obj.GroupVersionKind())
-	if err != nil {
-		return nil, err
-	}
-	// This will drop any omitempty fields, perform resource conversion etc...
-	unmarshalledObj := reflect.New(reflect.TypeOf(item).Elem()).Interface()
-	err = json.Unmarshal(data, &unmarshalledObj)
-	if err != nil {
-		return nil, err
-	}
-	unstrBody, err := runtime.DefaultUnstructuredConverter.ToUnstructured(unmarshalledObj)
-	if err != nil {
-		return nil, err
-	}
-	// remove all default values specified by custom formatter (e.g. creationTimestamp)
-	unstrBody = jsonutil.RemoveMapFields(obj.Object, unstrBody)
-	return &unstructured.Unstructured{Object: unstrBody}, nil
 }
 
 // WatchWithRetry returns channel of watch events or errors of failed to call watch API.
@@ -470,4 +420,12 @@ func WatchWithRetry(ctx context.Context, getWatch func() (watch.Interface, error
 		}
 	}()
 	return ch
+}
+
+func GetDeploymentReplicas(u *unstructured.Unstructured) *int64 {
+	val, found, err := unstructured.NestedInt64(u.Object, "spec", "replicas")
+	if !found || err != nil {
+		return nil
+	}
+	return &val
 }

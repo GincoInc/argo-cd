@@ -19,20 +19,22 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/argoproj/argo-cd/pkg/apiclient/application"
+	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	v1alpha1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	appclientset "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
-	"github.com/argoproj/argo-cd/reposerver"
-	"github.com/argoproj/argo-cd/reposerver/repository"
+	"github.com/argoproj/argo-cd/reposerver/apiclient"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
 	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/argo"
 	argoutil "github.com/argoproj/argo-cd/util/argo"
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/db"
+	"github.com/argoproj/argo-cd/util/diff"
 	"github.com/argoproj/argo-cd/util/git"
 	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/lua"
@@ -46,7 +48,7 @@ type Server struct {
 	ns            string
 	kubeclientset kubernetes.Interface
 	appclientset  appclientset.Interface
-	repoClientset reposerver.Clientset
+	repoClientset apiclient.Clientset
 	kubectl       kube.Kubectl
 	db            db.ArgoDB
 	enf           *rbac.Enforcer
@@ -62,14 +64,14 @@ func NewServer(
 	namespace string,
 	kubeclientset kubernetes.Interface,
 	appclientset appclientset.Interface,
-	repoClientset reposerver.Clientset,
+	repoClientset apiclient.Clientset,
 	cache *cache.Cache,
 	kubectl kube.Kubectl,
 	db db.ArgoDB,
 	enf *rbac.Enforcer,
 	projectLock *util.KeyLock,
 	settingsMgr *settings.SettingsManager,
-) ApplicationServiceServer {
+) application.ApplicationServiceServer {
 
 	return &Server{
 		ns:            namespace,
@@ -93,7 +95,7 @@ func appRBACName(app appv1.Application) string {
 }
 
 // List returns list of applications
-func (s *Server) List(ctx context.Context, q *ApplicationQuery) (*appv1.ApplicationList, error) {
+func (s *Server) List(ctx context.Context, q *application.ApplicationQuery) (*appv1.ApplicationList, error) {
 	appList, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).List(metav1.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -114,7 +116,7 @@ func (s *Server) List(ctx context.Context, q *ApplicationQuery) (*appv1.Applicat
 }
 
 // Create creates an application
-func (s *Server) Create(ctx context.Context, q *ApplicationCreateRequest) (*appv1.Application, error) {
+func (s *Server) Create(ctx context.Context, q *application.ApplicationCreateRequest) (*appv1.Application, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionCreate, appRBACName(q.Application)); err != nil {
 		return nil, err
 	}
@@ -155,7 +157,7 @@ func (s *Server) Create(ctx context.Context, q *ApplicationCreateRequest) (*appv
 }
 
 // GetManifests returns application manifests
-func (s *Server) GetManifests(ctx context.Context, q *ApplicationManifestQuery) (*repository.ManifestResponse, error) {
+func (s *Server) GetManifests(ctx context.Context, q *application.ApplicationManifestQuery) (*apiclient.ManifestResponse, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -163,8 +165,10 @@ func (s *Server) GetManifests(ctx context.Context, q *ApplicationManifestQuery) 
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(*a)); err != nil {
 		return nil, err
 	}
-	repo := s.getRepo(ctx, a.Spec.Source.RepoURL)
-
+	repo, err := s.db.GetRepository(ctx, a.Spec.Source.RepoURL)
+	if err != nil {
+		return nil, err
+	}
 	conn, repoClient, err := s.repoClientset.NewRepoServerClient()
 	if err != nil {
 		return nil, err
@@ -174,7 +178,7 @@ func (s *Server) GetManifests(ctx context.Context, q *ApplicationManifestQuery) 
 	if q.Revision != "" {
 		revision = q.Revision
 	}
-	settings, err := s.settingsMgr.GetSettings()
+	appInstanceLabelKey, err := s.settingsMgr.GetAppInstanceLabelKey()
 	if err != nil {
 		return nil, err
 	}
@@ -182,19 +186,35 @@ func (s *Server) GetManifests(ctx context.Context, q *ApplicationManifestQuery) 
 	if err != nil {
 		return nil, err
 	}
-	tools := make([]*appv1.ConfigManagementPlugin, len(settings.ConfigManagementPlugins))
-	for i := range settings.ConfigManagementPlugins {
-		tools[i] = &settings.ConfigManagementPlugins[i]
+
+	plugins, err := s.settingsMgr.GetConfigManagementPlugins()
+	if err != nil {
+		return nil, err
 	}
-	manifestInfo, err := repoClient.GenerateManifest(ctx, &repository.ManifestRequest{
+
+	tools := make([]*appv1.ConfigManagementPlugin, len(plugins))
+	for i := range plugins {
+		tools[i] = &plugins[i]
+	}
+	// If source is Kustomize add build options
+	buildOptions, err := s.settingsMgr.GetKustomizeBuildOptions()
+	if err != nil {
+		return nil, err
+	}
+	kustomizeOptions := appv1.KustomizeOptions{
+		BuildOptions: buildOptions,
+	}
+
+	manifestInfo, err := repoClient.GenerateManifest(ctx, &apiclient.ManifestRequest{
 		Repo:              repo,
 		Revision:          revision,
-		AppLabelKey:       settings.GetAppInstanceLabelKey(),
+		AppLabelKey:       appInstanceLabelKey,
 		AppLabelValue:     a.Name,
 		Namespace:         a.Spec.Destination.Namespace,
 		ApplicationSource: &a.Spec.Source,
 		HelmRepos:         helmRepos,
 		Plugins:           tools,
+		KustomizeOptions:  &kustomizeOptions,
 	})
 	if err != nil {
 		return nil, err
@@ -204,7 +224,7 @@ func (s *Server) GetManifests(ctx context.Context, q *ApplicationManifestQuery) 
 }
 
 // Get returns an application by name
-func (s *Server) Get(ctx context.Context, q *ApplicationQuery) (*appv1.Application, error) {
+func (s *Server) Get(ctx context.Context, q *application.ApplicationQuery) (*appv1.Application, error) {
 	appIf := s.appclientset.ArgoprojV1alpha1().Applications(s.ns)
 	a, err := appIf.Get(*q.Name, metav1.GetOptions{})
 	if err != nil {
@@ -231,7 +251,7 @@ func (s *Server) Get(ctx context.Context, q *ApplicationQuery) (*appv1.Applicati
 }
 
 // ListResourceEvents returns a list of event resources
-func (s *Server) ListResourceEvents(ctx context.Context, q *ApplicationResourceEventsQuery) (*v1.EventList, error) {
+func (s *Server) ListResourceEvents(ctx context.Context, q *application.ApplicationResourceEventsQuery) (*v1.EventList, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -279,7 +299,7 @@ func (s *Server) ListResourceEvents(ctx context.Context, q *ApplicationResourceE
 }
 
 // Update updates an application
-func (s *Server) Update(ctx context.Context, q *ApplicationUpdateRequest) (*appv1.Application, error) {
+func (s *Server) Update(ctx context.Context, q *application.ApplicationUpdateRequest) (*appv1.Application, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionUpdate, appRBACName(*q.Application)); err != nil {
 		return nil, err
 	}
@@ -300,7 +320,7 @@ func (s *Server) Update(ctx context.Context, q *ApplicationUpdateRequest) (*appv
 }
 
 // UpdateSpec updates an application spec and filters out any invalid parameter overrides
-func (s *Server) UpdateSpec(ctx context.Context, q *ApplicationUpdateSpecRequest) (*appv1.ApplicationSpec, error) {
+func (s *Server) UpdateSpec(ctx context.Context, q *application.ApplicationUpdateSpecRequest) (*appv1.ApplicationSpec, error) {
 	s.projectLock.Lock(q.Spec.Project)
 	defer s.projectLock.Unlock(q.Spec.Project)
 
@@ -337,19 +357,14 @@ func (s *Server) UpdateSpec(ctx context.Context, q *ApplicationUpdateSpecRequest
 }
 
 // Patch patches an application
-func (s *Server) Patch(ctx context.Context, q *ApplicationPatchRequest) (*appv1.Application, error) {
-
-	patch, err := jsonpatch.DecodePatch([]byte(q.Patch))
-	if err != nil {
-		return nil, err
-	}
+func (s *Server) Patch(ctx context.Context, q *application.ApplicationPatchRequest) (*appv1.Application, error) {
 
 	app, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
 	}
 
-	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionUpdate, appRBACName(*app)); err != nil {
+	if err = s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionOverride, appRBACName(*app)); err != nil {
 		return nil, err
 	}
 
@@ -358,9 +373,25 @@ func (s *Server) Patch(ctx context.Context, q *ApplicationPatchRequest) (*appv1.
 		return nil, err
 	}
 
-	patchApp, err := patch.Apply(jsonApp)
-	if err != nil {
-		return nil, err
+	var patchApp []byte
+
+	switch q.PatchType {
+	case "json", "":
+		patch, err := jsonpatch.DecodePatch([]byte(q.Patch))
+		if err != nil {
+			return nil, err
+		}
+		patchApp, err = patch.Apply(jsonApp)
+		if err != nil {
+			return nil, err
+		}
+	case "merge":
+		patchApp, err = jsonpatch.MergePatch(jsonApp, []byte(q.Patch))
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("Patch type '%s' is not supported", q.PatchType))
 	}
 
 	s.logEvent(app, ctx, argo.EventReasonResourceUpdated, fmt.Sprintf("patched application %s/%s", app.Namespace, app.Name))
@@ -379,7 +410,7 @@ func (s *Server) Patch(ctx context.Context, q *ApplicationPatchRequest) (*appv1.
 }
 
 // Delete removes an application and all associated resources
-func (s *Server) Delete(ctx context.Context, q *ApplicationDeleteRequest) (*ApplicationResponse, error) {
+func (s *Server) Delete(ctx context.Context, q *application.ApplicationDeleteRequest) (*application.ApplicationResponse, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.Name, metav1.GetOptions{})
 	if err != nil && !apierr.IsNotFound(err) {
 		return nil, err
@@ -406,9 +437,9 @@ func (s *Server) Delete(ctx context.Context, q *ApplicationDeleteRequest) (*Appl
 	}
 
 	if patchFinalizer {
-		// Prior to v0.6, the cascaded deletion finalizer was set during app creation.
-		// For backward compatibility, we always calculate the patch to see if we need to
-		// set/unset the finalizer (in case we are dealing with an app created prior to v0.6)
+		// Although the cascaded deletion finalizer is not set when apps are created via API,
+		// they will often be set by the user as part of declarative config. As part of a delete
+		// request, we always calculate the patch to see if we need to set/unset the finalizer.
 		patch, err := json.Marshal(map[string]interface{}{
 			"metadata": map[string]interface{}{
 				"finalizers": a.Finalizers,
@@ -429,36 +460,69 @@ func (s *Server) Delete(ctx context.Context, q *ApplicationDeleteRequest) (*Appl
 	}
 
 	s.logEvent(a, ctx, argo.EventReasonResourceDeleted, "deleted application")
-	return &ApplicationResponse{}, nil
+	return &application.ApplicationResponse{}, nil
 }
 
-func (s *Server) Watch(q *ApplicationQuery, ws ApplicationService_WatchServer) error {
-	w, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Watch(metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-	defer w.Stop()
+func (s *Server) Watch(q *application.ApplicationQuery, ws application.ApplicationService_WatchServer) error {
 	logCtx := log.NewEntry(log.New())
 	if q.Name != nil {
 		logCtx = logCtx.WithField("application", *q.Name)
 	}
 	claims := ws.Context().Value("claims")
+	// sendIfPermitted is a helper to send the application to the client's streaming channel if the
+	// caller has RBAC privileges permissions to view it
+	sendIfPermitted := func(a appv1.Application, eventType watch.EventType) error {
+		if !s.enf.Enforce(claims, rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(a)) {
+			// do not emit apps user does not have accessing
+			return nil
+		}
+		err := ws.Send(&appv1.ApplicationWatchEvent{
+			Type:        eventType,
+			Application: a,
+		})
+		if err != nil {
+			logCtx.Warnf("Unable to send stream message: %v", err)
+			return err
+		}
+		return nil
+	}
+
+	var listOpts metav1.ListOptions
+	if q.Name != nil && *q.Name != "" {
+		listOpts.FieldSelector = fmt.Sprintf("metadata.name=%s", *q.Name)
+	}
+	listOpts.ResourceVersion = q.ResourceVersion
+	if listOpts.ResourceVersion == "" {
+		// If resourceVersion is not supplied, we need to get latest version of the apps by first
+		// making a list request, which we then supply to the watch request. We always need to
+		// supply a resourceVersion to watch requests since without it, the return values may return
+		// stale data. See: https://github.com/argoproj/argo-cd/issues/1605
+		appsList, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).List(listOpts)
+		if err != nil {
+			return err
+		}
+		for _, a := range appsList.Items {
+			err = sendIfPermitted(a, watch.Modified)
+			if err != nil {
+				return err
+			}
+		}
+		listOpts.ResourceVersion = appsList.ResourceVersion
+	}
+
+	w, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Watch(listOpts)
+	if err != nil {
+		return err
+	}
+	defer w.Stop()
 	done := make(chan bool)
 	go func() {
 		for next := range w.ResultChan() {
-			a := *next.Object.(*appv1.Application)
-			if q.Name == nil || *q.Name == "" || *q.Name == a.Name {
-				if !s.enf.Enforce(claims, rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(a)) {
-					// do not emit apps user does not have accessing
-					continue
-				}
-				err = ws.Send(&appv1.ApplicationWatchEvent{
-					Type:        next.Type,
-					Application: a,
-				})
-				if err != nil {
-					logCtx.Warnf("Unable to send stream message: %v", err)
-				}
+			a, ok := next.Object.(*appv1.Application)
+			if ok {
+				_ = sendIfPermitted(*a, next.Type)
+			} else {
+				break
 			}
 		}
 		logCtx.Info("k8s application watch event channel closed")
@@ -501,19 +565,35 @@ func (s *Server) validateAndNormalizeApp(ctx context.Context, app *appv1.Applica
 		}
 	}
 
-	conditions, appSourceType, err := argo.GetSpecErrors(ctx, &app.Spec, proj, s.repoClientset, s.db)
+	buildOptions, err := s.settingsMgr.GetKustomizeBuildOptions()
+	if err != nil {
+		return err
+	}
+	kustomizeOptions := appv1.KustomizeOptions{
+		BuildOptions: buildOptions,
+	}
+	conditions, appSourceType, err := argo.ValidateRepo(ctx, &app.Spec, s.repoClientset, s.db, &kustomizeOptions)
 	if err != nil {
 		return err
 	}
 	if len(conditions) > 0 {
 		return status.Errorf(codes.InvalidArgument, "application spec is invalid: %s", argo.FormatAppConditions(conditions))
 	}
+
+	conditions, err = argo.ValidatePermissions(ctx, &app.Spec, proj, s.db)
+	if err != nil {
+		return err
+	}
+	if len(conditions) > 0 {
+		return status.Errorf(codes.InvalidArgument, "application spec is invalid: %s", argo.FormatAppConditions(conditions))
+	}
+
 	app.Spec = *argo.NormalizeApplicationSpec(&app.Spec, appSourceType)
 	return nil
 }
 
 func (s *Server) getApplicationClusterConfig(applicationName string) (*rest.Config, string, error) {
-	server, namespace, err := s.getApplicationDestination(context.Background(), applicationName)
+	server, namespace, err := s.getApplicationDestination(applicationName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -525,11 +605,11 @@ func (s *Server) getApplicationClusterConfig(applicationName string) (*rest.Conf
 	return config, namespace, err
 }
 
-func (s *Server) getAppResources(ctx context.Context, q *ResourcesQuery) (*appv1.ApplicationTree, error) {
+func (s *Server) getAppResources(q *application.ResourcesQuery) (*appv1.ApplicationTree, error) {
 	return s.cache.GetAppResourcesTree(*q.ApplicationName)
 }
 
-func (s *Server) getAppResource(ctx context.Context, action string, q *ApplicationResourceRequest) (*appv1.ResourceNode, *rest.Config, *appv1.Application, error) {
+func (s *Server) getAppResource(ctx context.Context, action string, q *application.ApplicationResourceRequest) (*appv1.ResourceNode, *rest.Config, *appv1.Application, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, nil, nil, err
@@ -538,7 +618,7 @@ func (s *Server) getAppResource(ctx context.Context, action string, q *Applicati
 		return nil, nil, nil, err
 	}
 
-	tree, err := s.getAppResources(ctx, &ResourcesQuery{ApplicationName: &a.Name})
+	tree, err := s.getAppResources(&application.ResourcesQuery{ApplicationName: &a.Name})
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -554,7 +634,7 @@ func (s *Server) getAppResource(ctx context.Context, action string, q *Applicati
 	return found, config, a, nil
 }
 
-func (s *Server) GetResource(ctx context.Context, q *ApplicationResourceRequest) (*ApplicationResourceResponse, error) {
+func (s *Server) GetResource(ctx context.Context, q *application.ApplicationResourceRequest) (*application.ApplicationResourceResponse, error) {
 	res, config, _, err := s.getAppResource(ctx, rbacpolicy.ActionGet, q)
 	if err != nil {
 		return nil, err
@@ -563,7 +643,7 @@ func (s *Server) GetResource(ctx context.Context, q *ApplicationResourceRequest)
 	if err != nil {
 		return nil, err
 	}
-	err = replaceSecretValues(obj)
+	obj, err = replaceSecretValues(obj)
 	if err != nil {
 		return nil, err
 	}
@@ -571,28 +651,23 @@ func (s *Server) GetResource(ctx context.Context, q *ApplicationResourceRequest)
 	if err != nil {
 		return nil, err
 	}
-	return &ApplicationResourceResponse{Manifest: string(data)}, nil
+	return &application.ApplicationResourceResponse{Manifest: string(data)}, nil
 }
 
-func replaceSecretValues(obj *unstructured.Unstructured) error {
+func replaceSecretValues(obj *unstructured.Unstructured) (*unstructured.Unstructured, error) {
 	if obj.GetKind() == kube.SecretKind && obj.GroupVersionKind().Group == "" {
-		data, _, _ := unstructured.NestedMap(obj.Object, "data")
-		if data != nil {
-			for k := range data {
-				data[k] = "**********"
-			}
-			err := unstructured.SetNestedField(obj.Object, data, "data")
-			if err != nil {
-				return err
-			}
+		_, obj, err := diff.HideSecretData(nil, obj)
+		if err != nil {
+			return nil, err
 		}
+		return obj, err
 	}
-	return nil
+	return obj, nil
 }
 
 // PatchResource patches a resource
-func (s *Server) PatchResource(ctx context.Context, q *ApplicationResourcePatchRequest) (*ApplicationResourceResponse, error) {
-	resourceRequest := &ApplicationResourceRequest{
+func (s *Server) PatchResource(ctx context.Context, q *application.ApplicationResourcePatchRequest) (*application.ApplicationResourceResponse, error) {
+	resourceRequest := &application.ApplicationResourceRequest{
 		Name:         q.Name,
 		Namespace:    q.Namespace,
 		ResourceName: q.ResourceName,
@@ -612,7 +687,7 @@ func (s *Server) PatchResource(ctx context.Context, q *ApplicationResourcePatchR
 	if err != nil {
 		return nil, err
 	}
-	err = replaceSecretValues(manifest)
+	manifest, err = replaceSecretValues(manifest)
 	if err != nil {
 		return nil, err
 	}
@@ -621,14 +696,14 @@ func (s *Server) PatchResource(ctx context.Context, q *ApplicationResourcePatchR
 		return nil, err
 	}
 	s.logEvent(a, ctx, argo.EventReasonResourceUpdated, fmt.Sprintf("patched resource %s/%s '%s'", q.Group, q.Kind, q.ResourceName))
-	return &ApplicationResourceResponse{
+	return &application.ApplicationResourceResponse{
 		Manifest: string(data),
 	}, nil
 }
 
 // DeleteResource deletes a specificed resource
-func (s *Server) DeleteResource(ctx context.Context, q *ApplicationResourceDeleteRequest) (*ApplicationResponse, error) {
-	resourceRequest := &ApplicationResourceRequest{
+func (s *Server) DeleteResource(ctx context.Context, q *application.ApplicationResourceDeleteRequest) (*application.ApplicationResponse, error) {
+	resourceRequest := &application.ApplicationResourceRequest{
 		Name:         q.Name,
 		Namespace:    q.Namespace,
 		ResourceName: q.ResourceName,
@@ -653,10 +728,10 @@ func (s *Server) DeleteResource(ctx context.Context, q *ApplicationResourceDelet
 		return nil, err
 	}
 	s.logEvent(a, ctx, argo.EventReasonResourceDeleted, fmt.Sprintf("deleted resource %s/%s '%s'", q.Group, q.Kind, q.ResourceName))
-	return &ApplicationResponse{}, nil
+	return &application.ApplicationResponse{}, nil
 }
 
-func (s *Server) ResourceTree(ctx context.Context, q *ResourcesQuery) (*appv1.ApplicationTree, error) {
+func (s *Server) ResourceTree(ctx context.Context, q *application.ResourcesQuery) (*appv1.ApplicationTree, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.ApplicationName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -664,10 +739,30 @@ func (s *Server) ResourceTree(ctx context.Context, q *ResourcesQuery) (*appv1.Ap
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(*a)); err != nil {
 		return nil, err
 	}
-	return s.getAppResources(ctx, q)
+	return s.getAppResources(q)
 }
 
-func (s *Server) ManagedResources(ctx context.Context, q *ResourcesQuery) (*ManagedResourcesResponse, error) {
+func (s *Server) RevisionMetadata(ctx context.Context, q *application.RevisionMetadataQuery) (*v1alpha1.RevisionMetadata, error) {
+	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(q.GetName(), metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionGet, appRBACName(*a)); err != nil {
+		return nil, err
+	}
+	repo, err := s.db.GetRepository(ctx, a.Spec.Source.RepoURL)
+	if err != nil {
+		return nil, err
+	}
+	conn, repoClient, err := s.repoClientset.NewRepoServerClient()
+	if err != nil {
+		return nil, err
+	}
+	defer util.Close(conn)
+	return repoClient.GetRevisionMetadata(ctx, &apiclient.RepoServerRevisionMetadataRequest{Repo: repo, Revision: q.GetRevision()})
+}
+
+func (s *Server) ManagedResources(ctx context.Context, q *application.ResourcesQuery) (*application.ManagedResourcesResponse, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*q.ApplicationName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -679,11 +774,11 @@ func (s *Server) ManagedResources(ctx context.Context, q *ResourcesQuery) (*Mana
 	if err != nil {
 		return nil, err
 	}
-	return &ManagedResourcesResponse{Items: items}, nil
+	return &application.ManagedResourcesResponse{Items: items}, nil
 }
 
-func (s *Server) PodLogs(q *ApplicationPodLogsQuery, ws ApplicationService_PodLogsServer) error {
-	pod, config, _, err := s.getAppResource(ws.Context(), rbacpolicy.ActionGet, &ApplicationResourceRequest{
+func (s *Server) PodLogs(q *application.ApplicationPodLogsQuery, ws application.ApplicationService_PodLogsServer) error {
+	pod, config, _, err := s.getAppResource(ws.Context(), rbacpolicy.ActionGet, &application.ApplicationResourceRequest{
 		Name:         q.Name,
 		Namespace:    q.Namespace,
 		Kind:         kube.PodKind,
@@ -734,7 +829,7 @@ func (s *Server) PodLogs(q *ApplicationPodLogsQuery, ws ApplicationService_PodLo
 				lines := strings.Join(parts[1:], " ")
 				for _, line := range strings.Split(lines, "\r") {
 					if line != "" {
-						err = ws.Send(&LogEntry{
+						err = ws.Send(&application.LogEntry{
 							Content:   line,
 							TimeStamp: metaLogTime,
 						})
@@ -763,7 +858,7 @@ func (s *Server) PodLogs(q *ApplicationPodLogsQuery, ws ApplicationService_PodLo
 	return nil
 }
 
-func (s *Server) getApplicationDestination(ctx context.Context, name string) (string, string, error) {
+func (s *Server) getApplicationDestination(name string) (string, string, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(name, metav1.GetOptions{})
 	if err != nil {
 		return "", "", err
@@ -772,17 +867,8 @@ func (s *Server) getApplicationDestination(ctx context.Context, name string) (st
 	return server, namespace, nil
 }
 
-func (s *Server) getRepo(ctx context.Context, repoURL string) *appv1.Repository {
-	repo, err := s.db.GetRepository(ctx, repoURL)
-	if err != nil {
-		// If we couldn't retrieve from the repo service, assume public repositories
-		repo = &appv1.Repository{Repo: repoURL}
-	}
-	return repo
-}
-
 // Sync syncs an application to its target state
-func (s *Server) Sync(ctx context.Context, syncReq *ApplicationSyncRequest) (*appv1.Application, error) {
+func (s *Server) Sync(ctx context.Context, syncReq *application.ApplicationSyncRequest) (*appv1.Application, error) {
 	appIf := s.appclientset.ArgoprojV1alpha1().Applications(s.ns)
 	a, err := appIf.Get(*syncReq.Name, metav1.GetOptions{})
 	if err != nil {
@@ -791,11 +877,19 @@ func (s *Server) Sync(ctx context.Context, syncReq *ApplicationSyncRequest) (*ap
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionSync, appRBACName(*a)); err != nil {
 		return nil, err
 	}
+	if syncReq.Manifests != nil {
+		if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceApplications, rbacpolicy.ActionOverride, appRBACName(*a)); err != nil {
+			return nil, err
+		}
+		if a.Spec.SyncPolicy != nil {
+			return nil, status.Error(codes.FailedPrecondition, "Cannot use local sync when Automatic Sync Policy is enabled")
+		}
+	}
 	if a.DeletionTimestamp != nil {
 		return nil, status.Errorf(codes.FailedPrecondition, "application is deleting")
 	}
 	if a.Spec.SyncPolicy != nil && a.Spec.SyncPolicy.Automated != nil {
-		if syncReq.Revision != "" && syncReq.Revision != a.Spec.Source.TargetRevision {
+		if syncReq.Revision != "" && syncReq.Revision != util.FirstNonEmpty(a.Spec.Source.TargetRevision, "HEAD") {
 			return nil, status.Errorf(codes.FailedPrecondition, "Cannot sync to %s: auto-sync currently set to %s", syncReq.Revision, a.Spec.Source.TargetRevision)
 		}
 	}
@@ -812,6 +906,7 @@ func (s *Server) Sync(ctx context.Context, syncReq *ApplicationSyncRequest) (*ap
 			DryRun:       syncReq.DryRun,
 			SyncStrategy: syncReq.Strategy,
 			Resources:    syncReq.Resources,
+			Manifests:    syncReq.Manifests,
 		},
 	}
 	a, err = argo.SetAppOperation(appIf, *syncReq.Name, &op)
@@ -825,7 +920,7 @@ func (s *Server) Sync(ctx context.Context, syncReq *ApplicationSyncRequest) (*ap
 	return a, err
 }
 
-func (s *Server) Rollback(ctx context.Context, rollbackReq *ApplicationRollbackRequest) (*appv1.Application, error) {
+func (s *Server) Rollback(ctx context.Context, rollbackReq *application.ApplicationRollbackRequest) (*appv1.Application, error) {
 	appIf := s.appclientset.ArgoprojV1alpha1().Applications(s.ns)
 	a, err := appIf.Get(*rollbackReq.Name, metav1.GetOptions{})
 	if err != nil {
@@ -876,7 +971,7 @@ func (s *Server) Rollback(ctx context.Context, rollbackReq *ApplicationRollbackR
 
 // resolveRevision resolves the git revision specified either in the sync request, or the
 // application source, into a concrete commit SHA that will be used for a sync operation.
-func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, syncReq *ApplicationSyncRequest) (string, string, error) {
+func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, syncReq *application.ApplicationSyncRequest) (string, string, error) {
 	ambiguousRevision := syncReq.Revision
 	if ambiguousRevision == "" {
 		ambiguousRevision = app.Spec.Source.TargetRevision
@@ -887,10 +982,9 @@ func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, sy
 	}
 	repo, err := s.db.GetRepository(ctx, app.Spec.Source.RepoURL)
 	if err != nil {
-		// If we couldn't retrieve from the repo service, assume public repositories
-		repo = &appv1.Repository{Repo: app.Spec.Source.RepoURL}
+		return "", "", err
 	}
-	gitClient, err := s.gitFactory.NewClient(repo.Repo, "", repo.Username, repo.Password, repo.SSHPrivateKey, repo.InsecureIgnoreHostKey)
+	gitClient, err := s.gitFactory.NewClient(repo.Repo, "", argoutil.GetRepoCreds(repo), repo.IsInsecure(), repo.IsLFSEnabled())
 	if err != nil {
 		return "", "", err
 	}
@@ -902,7 +996,7 @@ func (s *Server) resolveRevision(ctx context.Context, app *appv1.Application, sy
 	return commitSHA, displayRevision, nil
 }
 
-func (s *Server) TerminateOperation(ctx context.Context, termOpReq *OperationTerminateRequest) (*OperationTerminateResponse, error) {
+func (s *Server) TerminateOperation(ctx context.Context, termOpReq *application.OperationTerminateRequest) (*application.OperationTerminateResponse, error) {
 	a, err := s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Get(*termOpReq.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
@@ -918,7 +1012,7 @@ func (s *Server) TerminateOperation(ctx context.Context, termOpReq *OperationTer
 		a.Status.OperationState.Phase = appv1.OperationTerminating
 		_, err = s.appclientset.ArgoprojV1alpha1().Applications(s.ns).Update(a)
 		if err == nil {
-			return &OperationTerminateResponse{}, nil
+			return &application.OperationTerminateResponse{}, nil
 		}
 		if !apierr.IsConflict(err) {
 			return nil, err
@@ -944,7 +1038,7 @@ func (s *Server) logEvent(a *appv1.Application, ctx context.Context, reason stri
 	s.auditLogger.LogAppEvent(a, eventInfo, message)
 }
 
-func (s *Server) ListResourceActions(ctx context.Context, q *ApplicationResourceRequest) (*ResourceActionsListResponse, error) {
+func (s *Server) ListResourceActions(ctx context.Context, q *application.ApplicationResourceRequest) (*application.ResourceActionsListResponse, error) {
 	res, config, _, err := s.getAppResource(ctx, rbacpolicy.ActionGet, q)
 	if err != nil {
 		return nil, err
@@ -958,14 +1052,14 @@ func (s *Server) ListResourceActions(ctx context.Context, q *ApplicationResource
 		return nil, err
 	}
 
-	availableActions, err := s.getAvailableActions(config, resourceOverrides, obj, "")
+	availableActions, err := s.getAvailableActions(resourceOverrides, obj, "")
 	if err != nil {
 		return nil, err
 	}
-	return &ResourceActionsListResponse{Actions: availableActions}, nil
+	return &application.ResourceActionsListResponse{Actions: availableActions}, nil
 }
 
-func (s *Server) getAvailableActions(config *rest.Config, resourceOverrides map[string]v1alpha1.ResourceOverride, obj *unstructured.Unstructured, filterAction string) ([]appv1.ResourceAction, error) {
+func (s *Server) getAvailableActions(resourceOverrides map[string]v1alpha1.ResourceOverride, obj *unstructured.Unstructured, filterAction string) ([]appv1.ResourceAction, error) {
 	luaVM := lua.VM{
 		ResourceOverrides: resourceOverrides,
 	}
@@ -990,8 +1084,8 @@ func (s *Server) getAvailableActions(config *rest.Config, resourceOverrides map[
 
 }
 
-func (s *Server) RunResourceAction(ctx context.Context, q *ResourceActionRunRequest) (*ApplicationResponse, error) {
-	resourceRequest := &ApplicationResourceRequest{
+func (s *Server) RunResourceAction(ctx context.Context, q *application.ResourceActionRunRequest) (*application.ApplicationResponse, error) {
+	resourceRequest := &application.ApplicationResourceRequest{
 		Name:         q.Name,
 		Namespace:    q.Namespace,
 		ResourceName: q.ResourceName,
@@ -999,7 +1093,7 @@ func (s *Server) RunResourceAction(ctx context.Context, q *ResourceActionRunRequ
 		Version:      q.Version,
 		Group:        q.Group,
 	}
-	res, config, _, err := s.getAppResource(ctx, rbacpolicy.ActionGet, resourceRequest)
+	res, config, _, err := s.getAppResource(ctx, rbacpolicy.ActionOverride, resourceRequest)
 	if err != nil {
 		return nil, err
 	}
@@ -1012,7 +1106,7 @@ func (s *Server) RunResourceAction(ctx context.Context, q *ResourceActionRunRequ
 	if err != nil {
 		return nil, err
 	}
-	filteredAvailableActions, err := s.getAvailableActions(config, resourceOverrides, liveObj, q.Action)
+	filteredAvailableActions, err := s.getAvailableActions(resourceOverrides, liveObj, q.Action)
 	if err != nil {
 		return nil, err
 	}
@@ -1048,12 +1142,12 @@ func (s *Server) RunResourceAction(ctx context.Context, q *ResourceActionRunRequ
 		return nil, err
 	}
 	if string(diffBytes) == "{}" {
-		return &ApplicationResponse{}, nil
+		return &application.ApplicationResponse{}, nil
 	}
 
 	_, err = s.kubectl.PatchResource(config, newObj.GroupVersionKind(), newObj.GetName(), newObj.GetNamespace(), types.MergePatchType, diffBytes)
 	if err != nil {
 		return nil, err
 	}
-	return &ApplicationResponse{}, nil
+	return &application.ApplicationResponse{}, nil
 }

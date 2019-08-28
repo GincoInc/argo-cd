@@ -11,7 +11,7 @@ import (
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/errors"
 	appclientset "github.com/argoproj/argo-cd/pkg/client/clientset/versioned"
-	"github.com/argoproj/argo-cd/reposerver"
+	"github.com/argoproj/argo-cd/reposerver/apiclient"
 	"github.com/argoproj/argo-cd/server"
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/cli"
@@ -22,17 +22,20 @@ import (
 // NewCommand returns a new instance of an argocd command
 func NewCommand() *cobra.Command {
 	var (
-		insecure               bool
-		logLevel               string
-		glogLevel              int
-		clientConfig           clientcmd.ClientConfig
-		staticAssetsDir        string
-		baseHRef               string
-		repoServerAddress      string
-		dexServerAddress       string
-		disableAuth            bool
-		tlsConfigCustomizerSrc func() (tls.ConfigCustomizer, error)
-		cacheSrc               func() (*cache.Cache, error)
+		insecure                 bool
+		listenPort               int
+		metricsPort              int
+		logLevel                 string
+		glogLevel                int
+		clientConfig             clientcmd.ClientConfig
+		repoServerTimeoutSeconds int
+		staticAssetsDir          string
+		baseHRef                 string
+		repoServerAddress        string
+		dexServerAddress         string
+		disableAuth              bool
+		tlsConfigCustomizerSrc   func() (tls.ConfigCustomizer, error)
+		cacheSrc                 func() (*cache.Cache, error)
 	)
 	var command = &cobra.Command{
 		Use:   cliName,
@@ -57,10 +60,12 @@ func NewCommand() *cobra.Command {
 
 			kubeclientset := kubernetes.NewForConfigOrDie(config)
 			appclientset := appclientset.NewForConfigOrDie(config)
-			repoclientset := reposerver.NewRepoServerClientset(repoServerAddress)
+			repoclientset := apiclient.NewRepoServerClientset(repoServerAddress, repoServerTimeoutSeconds)
 
 			argoCDOpts := server.ArgoCDServerOpts{
 				Insecure:            insecure,
+				ListenPort:          listenPort,
+				MetricsPort:         metricsPort,
 				Namespace:           namespace,
 				StaticAssetsDir:     staticAssetsDir,
 				BaseHRef:            baseHRef,
@@ -81,7 +86,7 @@ func NewCommand() *cobra.Command {
 				ctx := context.Background()
 				ctx, cancel := context.WithCancel(ctx)
 				argocd := server.NewServer(ctx, argoCDOpts)
-				argocd.Run(ctx, common.PortAPIServer)
+				argocd.Run(ctx, listenPort, metricsPort)
 				cancel()
 			}
 		},
@@ -97,6 +102,9 @@ func NewCommand() *cobra.Command {
 	command.Flags().StringVar(&dexServerAddress, "dex-server", common.DefaultDexServerAddr, "Dex server address")
 	command.Flags().BoolVar(&disableAuth, "disable-auth", false, "Disable client authentication")
 	command.AddCommand(cli.NewVersionCmd(cliName))
+	command.Flags().IntVar(&listenPort, "port", common.DefaultPortAPIServer, "Listen on given port")
+	command.Flags().IntVar(&metricsPort, "metrics-port", common.DefaultPortArgoCDAPIServerMetrics, "Start metrics on given port")
+	command.Flags().IntVar(&repoServerTimeoutSeconds, "repo-server-timeout-seconds", 60, "Repo server RPC call timeout seconds.")
 	tlsConfigCustomizerSrc = tls.AddTLSFlagsToCmd(command)
 	cacheSrc = cache.AddCacheFlagsToCmd(command)
 	return command

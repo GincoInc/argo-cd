@@ -18,11 +18,11 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic/fake"
 
+	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/errors"
 	appv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	"github.com/argoproj/argo-cd/util/kube"
 	"github.com/argoproj/argo-cd/util/kube/kubetest"
-	"github.com/argoproj/argo-cd/util/settings"
 )
 
 func strToUnstructured(jsonStr string) *unstructured.Unstructured {
@@ -43,24 +43,30 @@ var (
   apiVersion: v1
   kind: Pod
   metadata:
+    uid: "1"
     name: helm-guestbook-pod
     namespace: default
     ownerReferences:
-    - apiVersion: extensions/v1beta1
+    - apiVersion: apps/v1
       kind: ReplicaSet
       name: helm-guestbook-rs
+      uid: "2"
     resourceVersion: "123"`)
 
 	testRS = strToUnstructured(`
   apiVersion: apps/v1
   kind: ReplicaSet
   metadata:
+    uid: "2"
     name: helm-guestbook-rs
     namespace: default
+    annotations:
+      deployment.kubernetes.io/revision: "2"
     ownerReferences:
-    - apiVersion: extensions/v1beta1
+    - apiVersion: apps/v1beta1
       kind: Deployment
       name: helm-guestbook
+      uid: "3"
     resourceVersion: "123"`)
 
 	testDeploy = strToUnstructured(`
@@ -69,6 +75,7 @@ var (
   metadata:
     labels:
       app.kubernetes.io/instance: helm-guestbook
+    uid: "3"
     name: helm-guestbook
     namespace: default
     resourceVersion: "123"`)
@@ -80,6 +87,7 @@ var (
     name: helm-guestbook
     namespace: default
     resourceVersion: "123"
+    uid: "4"
   spec:
     selector:
       app: guestbook
@@ -95,6 +103,7 @@ var (
   metadata:
     name: helm-guestbook
     namespace: default
+    uid: "4"
   spec:
     backend:
       serviceName: not-found-service
@@ -106,6 +115,10 @@ var (
         - backend:
             serviceName: helm-guestbook
             servicePort: 443
+          path: /
+        - backend:
+            serviceName: helm-guestbook
+            servicePort: https
           path: /
   status:
     loadBalancer:
@@ -135,31 +148,64 @@ func newCluster(objs ...*unstructured.Unstructured) *clusterInfo {
 		Meta:      metav1.APIResource{Namespaced: true},
 	}}
 
-	return newClusterExt(kubetest.MockKubectlCmd{APIResources: apiResources})
+	return newClusterExt(&kubetest.MockKubectlCmd{APIResources: apiResources})
 }
 
 func newClusterExt(kubectl kube.Kubectl) *clusterInfo {
 	return &clusterInfo{
-		lock:         &sync.Mutex{},
-		nodes:        make(map[kube.ResourceKey]*node),
-		onAppUpdated: func(appName string, fullRefresh bool) {},
-		kubectl:      kubectl,
-		nsIndex:      make(map[string]map[kube.ResourceKey]*node),
-		cluster:      &appv1.Cluster{},
-		syncTime:     nil,
-		syncLock:     &sync.Mutex{},
-		apisMeta:     make(map[schema.GroupKind]*apiMeta),
-		log:          log.WithField("cluster", "test"),
-		settings:     &settings.ArgoCDSettings{},
+		lock:            &sync.Mutex{},
+		nodes:           make(map[kube.ResourceKey]*node),
+		onObjectUpdated: func(managedByApp map[string]bool, reference corev1.ObjectReference) {},
+		kubectl:         kubectl,
+		nsIndex:         make(map[string]map[kube.ResourceKey]*node),
+		cluster:         &appv1.Cluster{},
+		syncTime:        nil,
+		syncLock:        &sync.Mutex{},
+		apisMeta:        make(map[schema.GroupKind]*apiMeta),
+		log:             log.WithField("cluster", "test"),
+		cacheSettingsSrc: func() *cacheSettings {
+			return &cacheSettings{AppInstanceLabelKey: common.LabelKeyAppInstance}
+		},
 	}
 }
 
 func getChildren(cluster *clusterInfo, un *unstructured.Unstructured) []appv1.ResourceNode {
 	hierarchy := make([]appv1.ResourceNode, 0)
-	cluster.iterateHierarchy(kube.GetResourceKey(un), func(child appv1.ResourceNode) {
+	cluster.iterateHierarchy(kube.GetResourceKey(un), func(child appv1.ResourceNode, app string) {
 		hierarchy = append(hierarchy, child)
 	})
 	return hierarchy[1:]
+}
+
+func TestGetNamespaceResources(t *testing.T) {
+	defaultNamespaceTopLevel1 := strToUnstructured(`
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata: {"name": "helm-guestbook1", "namespace": "default"}
+`)
+	defaultNamespaceTopLevel2 := strToUnstructured(`
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata: {"name": "helm-guestbook2", "namespace": "default"}
+`)
+	kubesystemNamespaceTopLevel2 := strToUnstructured(`
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata: {"name": "helm-guestbook3", "namespace": "kube-system"}
+`)
+
+	cluster := newCluster(defaultNamespaceTopLevel1, defaultNamespaceTopLevel2, kubesystemNamespaceTopLevel2)
+	err := cluster.ensureSynced()
+	assert.Nil(t, err)
+
+	resources := cluster.getNamespaceTopLevelResources("default")
+	assert.Len(t, resources, 2)
+	assert.Equal(t, resources[kube.GetResourceKey(defaultNamespaceTopLevel1)].Name, "helm-guestbook1")
+	assert.Equal(t, resources[kube.GetResourceKey(defaultNamespaceTopLevel2)].Name, "helm-guestbook2")
+
+	resources = cluster.getNamespaceTopLevelResources("kube-system")
+	assert.Len(t, resources, 1)
+	assert.Equal(t, resources[kube.GetResourceKey(kubesystemNamespaceTopLevel2)].Name, "helm-guestbook3")
 }
 
 func TestGetChildren(t *testing.T) {
@@ -175,6 +221,7 @@ func TestGetChildren(t *testing.T) {
 			Name:      "helm-guestbook-pod",
 			Group:     "",
 			Version:   "v1",
+			UID:       "1",
 		},
 		ParentRefs: []appv1.ResourceRef{{
 			Group:     "apps",
@@ -182,6 +229,7 @@ func TestGetChildren(t *testing.T) {
 			Kind:      "ReplicaSet",
 			Namespace: "default",
 			Name:      "helm-guestbook-rs",
+			UID:       "2",
 		}},
 		Health:          &appv1.HealthStatus{Status: appv1.HealthStatusUnknown},
 		NetworkingInfo:  &appv1.ResourceNetworkingInfo{Labels: testPod.GetLabels()},
@@ -197,11 +245,12 @@ func TestGetChildren(t *testing.T) {
 			Name:      "helm-guestbook-rs",
 			Group:     "apps",
 			Version:   "v1",
+			UID:       "2",
 		},
 		ResourceVersion: "123",
 		Health:          &appv1.HealthStatus{Status: appv1.HealthStatusHealthy},
-		Info:            []appv1.InfoItem{},
-		ParentRefs:      []appv1.ResourceRef{{Group: "apps", Version: "", Kind: "Deployment", Namespace: "default", Name: "helm-guestbook"}},
+		Info:            []appv1.InfoItem{{Name: "Revision", Value: "Rev:2"}},
+		ParentRefs:      []appv1.ResourceRef{{Group: "apps", Version: "", Kind: "Deployment", Namespace: "default", Name: "helm-guestbook", UID: "3"}},
 	}}, rsChildren...), deployChildren)
 }
 
@@ -225,7 +274,7 @@ metadata:
 				Namespace: "default",
 			},
 		},
-	}, []*unstructured.Unstructured{targetDeploy})
+	}, []*unstructured.Unstructured{targetDeploy}, nil)
 	assert.Nil(t, err)
 	assert.Equal(t, managedObjs, map[kube.ResourceKey]*unstructured.Unstructured{
 		kube.NewResourceKey("apps", "Deployment", "default", "helm-guestbook"): testDeploy,
@@ -237,8 +286,7 @@ func TestChildDeletedEvent(t *testing.T) {
 	err := cluster.ensureSynced()
 	assert.Nil(t, err)
 
-	err = cluster.processEvent(watch.Deleted, testPod)
-	assert.Nil(t, err)
+	cluster.processEvent(watch.Deleted, testPod)
 
 	rsChildren := getChildren(cluster, testRS)
 	assert.Equal(t, []appv1.ResourceNode{}, rsChildren)
@@ -253,16 +301,17 @@ func TestProcessNewChildEvent(t *testing.T) {
   apiVersion: v1
   kind: Pod
   metadata:
+    uid: "4"
     name: helm-guestbook-pod2
     namespace: default
     ownerReferences:
-    - apiVersion: extensions/v1beta1
+    - apiVersion: apps/v1
       kind: ReplicaSet
       name: helm-guestbook-rs
+      uid: "2"
     resourceVersion: "123"`)
 
-	err = cluster.processEvent(watch.Added, newPod)
-	assert.Nil(t, err)
+	cluster.processEvent(watch.Added, newPod)
 
 	rsChildren := getChildren(cluster, testRS)
 	sort.Slice(rsChildren, func(i, j int) bool {
@@ -275,6 +324,7 @@ func TestProcessNewChildEvent(t *testing.T) {
 			Name:      "helm-guestbook-pod",
 			Group:     "",
 			Version:   "v1",
+			UID:       "1",
 		},
 		Info:           []appv1.InfoItem{{Name: "Containers", Value: "0/0"}},
 		Health:         &appv1.HealthStatus{Status: appv1.HealthStatusUnknown},
@@ -285,6 +335,7 @@ func TestProcessNewChildEvent(t *testing.T) {
 			Kind:      "ReplicaSet",
 			Namespace: "default",
 			Name:      "helm-guestbook-rs",
+			UID:       "2",
 		}},
 		ResourceVersion: "123",
 	}, {
@@ -294,6 +345,7 @@ func TestProcessNewChildEvent(t *testing.T) {
 			Name:      "helm-guestbook-pod2",
 			Group:     "",
 			Version:   "v1",
+			UID:       "4",
 		},
 		NetworkingInfo: &appv1.ResourceNetworkingInfo{Labels: testPod.GetLabels()},
 		Info:           []appv1.InfoItem{{Name: "Containers", Value: "0/0"}},
@@ -304,6 +356,7 @@ func TestProcessNewChildEvent(t *testing.T) {
 			Kind:      "ReplicaSet",
 			Namespace: "default",
 			Name:      "helm-guestbook-rs",
+			UID:       "2",
 		}},
 		ResourceVersion: "123",
 	}}, rsChildren)
@@ -339,8 +392,7 @@ func TestUpdateResourceTags(t *testing.T) {
 			},
 		}},
 	}
-	err = cluster.processEvent(watch.Modified, mustToUnstructured(pod))
-	assert.Nil(t, err)
+	cluster.processEvent(watch.Modified, mustToUnstructured(pod))
 
 	podNode = cluster.nodes[kube.GetResourceKey(mustToUnstructured(pod))]
 
@@ -351,15 +403,16 @@ func TestUpdateResourceTags(t *testing.T) {
 func TestUpdateAppResource(t *testing.T) {
 	updatesReceived := make([]string, 0)
 	cluster := newCluster(testPod, testRS, testDeploy)
-	cluster.onAppUpdated = func(appName string, fullRefresh bool) {
-		updatesReceived = append(updatesReceived, fmt.Sprintf("%s: %v", appName, fullRefresh))
+	cluster.onObjectUpdated = func(managedByApp map[string]bool, _ corev1.ObjectReference) {
+		for appName, fullRefresh := range managedByApp {
+			updatesReceived = append(updatesReceived, fmt.Sprintf("%s: %v", appName, fullRefresh))
+		}
 	}
 
 	err := cluster.ensureSynced()
 	assert.Nil(t, err)
 
-	err = cluster.processEvent(watch.Modified, mustToUnstructured(testPod))
-	assert.Nil(t, err)
+	cluster.processEvent(watch.Modified, mustToUnstructured(testPod))
 
 	assert.Contains(t, updatesReceived, "helm-guestbook: false")
 }
@@ -414,4 +467,22 @@ func TestWatchCacheUpdated(t *testing.T) {
 
 	_, ok = cluster.nodes[kube.GetResourceKey(added)]
 	assert.True(t, ok)
+}
+
+func TestGetDuplicatedChildren(t *testing.T) {
+	extensionsRS := testRS.DeepCopy()
+	extensionsRS.SetGroupVersionKind(schema.GroupVersionKind{Group: "extensions", Kind: kube.ReplicaSetKind, Version: "v1beta1"})
+	cluster := newCluster(testDeploy, testRS, extensionsRS)
+	err := cluster.ensureSynced()
+
+	assert.Nil(t, err)
+
+	// Get children multiple times to make sure the right child is picked up every time.
+	for i := 0; i < 5; i++ {
+		children := getChildren(cluster, testDeploy)
+		assert.Len(t, children, 1)
+		assert.Equal(t, "apps", children[0].Group)
+		assert.Equal(t, kube.ReplicaSetKind, children[0].Kind)
+		assert.Equal(t, testRS.GetName(), children[0].Name)
+	}
 }

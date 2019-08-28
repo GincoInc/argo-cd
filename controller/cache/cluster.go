@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"k8s.io/apimachinery/pkg/types"
+
+	"github.com/argoproj/argo-cd/controller/metrics"
+
 	log "github.com/sirupsen/logrus"
-	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -19,7 +24,6 @@ import (
 	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/health"
 	"github.com/argoproj/argo-cd/util/kube"
-	"github.com/argoproj/argo-cd/util/settings"
 )
 
 const (
@@ -44,11 +48,11 @@ type clusterInfo struct {
 	nodes   map[kube.ResourceKey]*node
 	nsIndex map[string]map[kube.ResourceKey]*node
 
-	onAppUpdated func(appName string, fullRefresh bool)
-	kubectl      kube.Kubectl
-	cluster      *appv1.Cluster
-	log          *log.Entry
-	settings     *settings.ArgoCDSettings
+	onObjectUpdated  ObjectUpdatedHandler
+	kubectl          kube.Kubectl
+	cluster          *appv1.Cluster
+	log              *log.Entry
+	cacheSettingsSrc func() *cacheSettings
 }
 
 func (c *clusterInfo) replaceResourceCache(gk schema.GroupKind, resourceVersion string, objs []unstructured.Unstructured) {
@@ -81,6 +85,33 @@ func (c *clusterInfo) replaceResourceCache(gk schema.GroupKind, resourceVersion 
 	}
 }
 
+func isServiceAccountTokenSecret(un *unstructured.Unstructured) (bool, metav1.OwnerReference) {
+	ref := metav1.OwnerReference{
+		APIVersion: "v1",
+		Kind:       kube.ServiceAccountKind,
+	}
+	if un.GetKind() != kube.SecretKind || un.GroupVersionKind().Group != "" {
+		return false, ref
+	}
+
+	if typeVal, ok, err := unstructured.NestedString(un.Object, "type"); !ok || err != nil || typeVal != "kubernetes.io/service-account-token" {
+		return false, ref
+	}
+
+	annotations := un.GetAnnotations()
+	if annotations == nil {
+		return false, ref
+	}
+
+	id, okId := annotations["kubernetes.io/service-account.uid"]
+	name, okName := annotations["kubernetes.io/service-account.name"]
+	if okId && okName {
+		ref.Name = name
+		ref.UID = types.UID(id)
+	}
+	return ref.Name != "" && ref.UID != "", ref
+}
+
 func (c *clusterInfo) createObjInfo(un *unstructured.Unstructured, appInstanceLabel string) *node {
 	ownerRefs := un.GetOwnerReferences()
 	// Special case for endpoint. Remove after https://github.com/kubernetes/kubernetes/issues/28483 is fixed
@@ -88,26 +119,28 @@ func (c *clusterInfo) createObjInfo(un *unstructured.Unstructured, appInstanceLa
 		ownerRefs = append(ownerRefs, metav1.OwnerReference{
 			Name:       un.GetName(),
 			Kind:       kube.ServiceKind,
-			APIVersion: "",
+			APIVersion: "v1",
 		})
 	}
+
+	// edge case. Consider auto-created service account tokens as a child of service account objects
+	if yes, ref := isServiceAccountTokenSecret(un); yes {
+		ownerRefs = append(ownerRefs, ref)
+	}
+
 	nodeInfo := &node{
 		resourceVersion: un.GetResourceVersion(),
-		ref: v1.ObjectReference{
-			APIVersion: un.GetAPIVersion(),
-			Kind:       un.GetKind(),
-			Name:       un.GetName(),
-			Namespace:  un.GetNamespace(),
-		},
-		ownerRefs: ownerRefs,
+		ref:             kube.GetObjectRef(un),
+		ownerRefs:       ownerRefs,
 	}
+
 	populateNodeInfo(un, nodeInfo)
 	appName := kube.GetAppInstanceLabel(un, appInstanceLabel)
 	if len(ownerRefs) == 0 && appName != "" {
 		nodeInfo.appName = appName
 		nodeInfo.resource = un
 	}
-	nodeInfo.health, _ = health.GetResourceHealth(un, c.settings.ResourceOverrides)
+	nodeInfo.health, _ = health.GetResourceHealth(un, c.cacheSettingsSrc().ResourceOverrides)
 	return nodeInfo
 }
 
@@ -166,7 +199,7 @@ func (c *clusterInfo) stopWatching(gk schema.GroupKind) {
 // startMissingWatches lists supported cluster resources and start watching for changes unless watch is already running
 func (c *clusterInfo) startMissingWatches() error {
 
-	apis, err := c.kubectl.GetAPIResources(c.cluster.RESTConfig(), c.settings)
+	apis, err := c.kubectl.GetAPIResources(c.cluster.RESTConfig(), c.cacheSettingsSrc().ResourcesFilter)
 	if err != nil {
 		return err
 	}
@@ -238,12 +271,7 @@ func (c *clusterInfo) watchEvents(ctx context.Context, api kube.APIResourceInfo,
 				if ok {
 					obj := event.Object.(*unstructured.Unstructured)
 					info.resourceVersion = obj.GetResourceVersion()
-					err = c.processEvent(event.Type, obj)
-					if err != nil {
-						log.Warnf("Failed to process event %s %s/%s/%s: %v", event.Type, obj.GroupVersionKind(), obj.GetNamespace(), obj.GetName(), err)
-						continue
-					}
-
+					c.processEvent(event.Type, obj)
 					if kube.IsCRD(obj) {
 						if event.Type == watch.Deleted {
 							group, groupOk, groupErr := unstructured.NestedString(obj.Object, "spec", "group")
@@ -282,7 +310,7 @@ func (c *clusterInfo) sync() (err error) {
 	c.apisMeta = make(map[schema.GroupKind]*apiMeta)
 	c.nodes = make(map[kube.ResourceKey]*node)
 
-	apis, err := c.kubectl.GetAPIResources(c.cluster.RESTConfig(), c.settings)
+	apis, err := c.kubectl.GetAPIResources(c.cluster.RESTConfig(), c.cacheSettingsSrc().ResourcesFilter)
 	if err != nil {
 		return err
 	}
@@ -296,7 +324,7 @@ func (c *clusterInfo) sync() (err error) {
 
 		lock.Lock()
 		for i := range list.Items {
-			c.setNode(c.createObjInfo(&list.Items[i], c.settings.GetAppInstanceLabelKey()))
+			c.setNode(c.createObjInfo(&list.Items[i], c.cacheSettingsSrc().AppInstanceLabelKey))
 		}
 		lock.Unlock()
 		return nil
@@ -329,29 +357,56 @@ func (c *clusterInfo) ensureSynced() error {
 	return c.syncError
 }
 
-func (c *clusterInfo) iterateHierarchy(key kube.ResourceKey, action func(child appv1.ResourceNode)) {
+func (c *clusterInfo) getNamespaceTopLevelResources(namespace string) map[kube.ResourceKey]appv1.ResourceNode {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	nodes := make(map[kube.ResourceKey]appv1.ResourceNode)
+	for _, node := range c.nsIndex[namespace] {
+		if len(node.ownerRefs) == 0 {
+			nodes[node.resourceKey()] = node.asResourceNode()
+		}
+	}
+	return nodes
+}
+
+func (c *clusterInfo) iterateHierarchy(key kube.ResourceKey, action func(child appv1.ResourceNode, appName string)) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	if objInfo, ok := c.nodes[key]; ok {
-		action(objInfo.asResourceNode())
 		nsNodes := c.nsIndex[key.Namespace]
+		action(objInfo.asResourceNode(), objInfo.getApp(nsNodes))
+		childrenByUID := make(map[types.UID][]*node)
 		for _, child := range nsNodes {
 			if objInfo.isParentOf(child) {
-				action(child.asResourceNode())
+				childrenByUID[child.ref.UID] = append(childrenByUID[child.ref.UID], child)
+			}
+		}
+		// make sure children has no duplicates
+		for _, children := range childrenByUID {
+			if len(children) > 0 {
+				// The object might have multiple children with the same UID (e.g. replicaset from apps and extensions group). It is ok to pick any object but we need to make sure
+				// we pick the same child after every refresh.
+				sort.Slice(children, func(i, j int) bool {
+					key1 := children[i].resourceKey()
+					key2 := children[j].resourceKey()
+					return strings.Compare(key1.String(), key2.String()) < 0
+				})
+				child := children[0]
+				action(child.asResourceNode(), child.getApp(nsNodes))
 				child.iterateChildren(nsNodes, map[kube.ResourceKey]bool{objInfo.resourceKey(): true}, action)
 			}
 		}
 	}
 }
 
-func (c *clusterInfo) isNamespaced(obj *unstructured.Unstructured) bool {
-	if api, ok := c.apisMeta[kube.GetResourceKey(obj).GroupKind()]; ok && !api.namespaced {
+func (c *clusterInfo) isNamespaced(gk schema.GroupKind) bool {
+	if api, ok := c.apisMeta[gk]; ok && !api.namespaced {
 		return false
 	}
 	return true
 }
 
-func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*unstructured.Unstructured) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
+func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*unstructured.Unstructured, metricsServer *metrics.MetricsServer) (map[kube.ResourceKey]*unstructured.Unstructured, error) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -362,12 +417,13 @@ func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*uns
 			managedObjs[key] = o.resource
 		}
 	}
+	config := metrics.AddMetricsTransportWrapper(metricsServer, a, c.cluster.RESTConfig())
 	// iterate target objects and identify ones that already exist in the cluster,\
 	// but are simply missing our label
 	lock := &sync.Mutex{}
 	err := util.RunAllAsync(len(targetObjs), func(i int) error {
 		targetObj := targetObjs[i]
-		key := GetTargetObjKey(a, targetObj, c.isNamespaced(targetObj))
+		key := GetTargetObjKey(a, targetObj, c.isNamespaced(targetObj.GroupVersionKind().GroupKind()))
 		lock.Lock()
 		managedObj := managedObjs[key]
 		lock.Unlock()
@@ -378,7 +434,7 @@ func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*uns
 					managedObj = existingObj.resource
 				} else {
 					var err error
-					managedObj, err = c.kubectl.GetResource(c.cluster.RESTConfig(), targetObj.GroupVersionKind(), existingObj.ref.Name, existingObj.ref.Namespace)
+					managedObj, err = c.kubectl.GetResource(config, targetObj.GroupVersionKind(), existingObj.ref.Name, existingObj.ref.Namespace)
 					if err != nil {
 						if errors.IsNotFound(err) {
 							return nil
@@ -386,13 +442,32 @@ func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*uns
 						return err
 					}
 				}
+			} else if _, watched := c.apisMeta[key.GroupKind()]; !watched {
+				var err error
+				managedObj, err = c.kubectl.GetResource(config, targetObj.GroupVersionKind(), targetObj.GetName(), targetObj.GetNamespace())
+				if err != nil {
+					if errors.IsNotFound(err) {
+						return nil
+					}
+					return err
+				}
 			}
 		}
 
 		if managedObj != nil {
-			managedObj, err := c.kubectl.ConvertToVersion(managedObj, targetObj.GroupVersionKind().Group, targetObj.GroupVersionKind().Version)
+			converted, err := c.kubectl.ConvertToVersion(managedObj, targetObj.GroupVersionKind().Group, targetObj.GroupVersionKind().Version)
 			if err != nil {
-				return err
+				// fallback to loading resource from kubernetes if conversion fails
+				log.Warnf("Failed to convert resource: %v", err)
+				managedObj, err = c.kubectl.GetResource(config, targetObj.GroupVersionKind(), managedObj.GetName(), managedObj.GetNamespace())
+				if err != nil {
+					if errors.IsNotFound(err) {
+						return nil
+					}
+					return err
+				}
+			} else {
+				managedObj = converted
 			}
 			lock.Lock()
 			managedObjs[key] = managedObj
@@ -407,11 +482,7 @@ func (c *clusterInfo) getManagedLiveObjs(a *appv1.Application, targetObjs []*uns
 	return managedObjs, nil
 }
 
-func (c *clusterInfo) delete(obj *unstructured.Unstructured) error {
-	return c.kubectl.DeleteResource(c.cluster.RESTConfig(), obj.GroupVersionKind(), obj.GetName(), obj.GetNamespace(), false)
-}
-
-func (c *clusterInfo) processEvent(event watch.EventType, un *unstructured.Unstructured) error {
+func (c *clusterInfo) processEvent(event watch.EventType, un *unstructured.Unstructured) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	key := kube.GetResourceKey(un)
@@ -423,8 +494,6 @@ func (c *clusterInfo) processEvent(event watch.EventType, un *unstructured.Unstr
 	} else if event != watch.Deleted {
 		c.onNodeUpdated(exists, existingNode, un, key)
 	}
-
-	return nil
 }
 
 func (c *clusterInfo) onNodeUpdated(exists bool, existingNode *node, un *unstructured.Unstructured, key kube.ResourceKey) {
@@ -432,7 +501,7 @@ func (c *clusterInfo) onNodeUpdated(exists bool, existingNode *node, un *unstruc
 	if exists {
 		nodes = append(nodes, existingNode)
 	}
-	newObj := c.createObjInfo(un, c.settings.GetAppInstanceLabelKey())
+	newObj := c.createObjInfo(un, c.cacheSettingsSrc().AppInstanceLabelKey)
 	c.setNode(newObj)
 	nodes = append(nodes, newObj)
 	toNotify := make(map[string]bool)
@@ -446,9 +515,7 @@ func (c *clusterInfo) onNodeUpdated(exists bool, existingNode *node, un *unstruc
 			toNotify[app] = n.isRootAppNode() || toNotify[app]
 		}
 	}
-	for name, full := range toNotify {
-		c.onAppUpdated(name, full)
-	}
+	c.onObjectUpdated(toNotify, newObj.ref)
 }
 
 func (c *clusterInfo) onNodeRemoved(key kube.ResourceKey, n *node) {
@@ -458,9 +525,11 @@ func (c *clusterInfo) onNodeRemoved(key kube.ResourceKey, n *node) {
 	}
 
 	c.removeNode(key)
+	managedByApp := make(map[string]bool)
 	if appName != "" {
-		c.onAppUpdated(appName, n.isRootAppNode())
+		managedByApp[appName] = n.isRootAppNode()
 	}
+	c.onObjectUpdated(managedByApp, n.ref)
 }
 
 var (

@@ -7,17 +7,20 @@ import (
 	"path/filepath"
 	"reflect"
 
+	"github.com/argoproj/argo-cd/util/settings"
+
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	repositorypkg "github.com/argoproj/argo-cd/pkg/apiclient/repository"
 	appsv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
-	"github.com/argoproj/argo-cd/reposerver"
-	"github.com/argoproj/argo-cd/reposerver/repository"
+	"github.com/argoproj/argo-cd/reposerver/apiclient"
 	"github.com/argoproj/argo-cd/server/rbacpolicy"
 	"github.com/argoproj/argo-cd/util"
+	"github.com/argoproj/argo-cd/util/argo"
 	"github.com/argoproj/argo-cd/util/cache"
 	"github.com/argoproj/argo-cd/util/db"
 	"github.com/argoproj/argo-cd/util/git"
@@ -28,23 +31,26 @@ import (
 // Server provides a Repository service
 type Server struct {
 	db            db.ArgoDB
-	repoClientset reposerver.Clientset
+	repoClientset apiclient.Clientset
 	enf           *rbac.Enforcer
 	cache         *cache.Cache
+	settings      *settings.SettingsManager
 }
 
 // NewServer returns a new instance of the Repository service
 func NewServer(
-	repoClientset reposerver.Clientset,
+	repoClientset apiclient.Clientset,
 	db db.ArgoDB,
 	enf *rbac.Enforcer,
 	cache *cache.Cache,
+	settings *settings.SettingsManager,
 ) *Server {
 	return &Server{
 		db:            db,
 		repoClientset: repoClientset,
 		enf:           enf,
 		cache:         cache,
+		settings:      settings,
 	}
 }
 
@@ -59,7 +65,7 @@ func (s *Server) getConnectionState(ctx context.Context, url string) appsv1.Conn
 	}
 	repo, err := s.db.GetRepository(ctx, url)
 	if err == nil {
-		err = git.TestRepo(repo.Repo, repo.Username, repo.Password, repo.SSHPrivateKey, repo.InsecureIgnoreHostKey)
+		err = git.TestRepo(repo.Repo, argo.GetRepoCreds(repo), repo.IsInsecure(), repo.EnableLFS)
 	}
 	if err != nil {
 		connectionState.Status = appsv1.ConnectionStatusFailed
@@ -73,7 +79,7 @@ func (s *Server) getConnectionState(ctx context.Context, url string) appsv1.Conn
 }
 
 // List returns list of repositories
-func (s *Server) List(ctx context.Context, q *RepoQuery) (*appsv1.RepositoryList, error) {
+func (s *Server) List(ctx context.Context, q *repositorypkg.RepoQuery) (*appsv1.RepositoryList, error) {
 	urls, err := s.db.ListRepoURLs(ctx)
 	if err != nil {
 		return nil, err
@@ -81,7 +87,16 @@ func (s *Server) List(ctx context.Context, q *RepoQuery) (*appsv1.RepositoryList
 	items := make([]appsv1.Repository, 0)
 	for _, url := range urls {
 		if s.enf.Enforce(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionGet, url) {
-			items = append(items, appsv1.Repository{Repo: url})
+			repo, err := s.db.GetRepository(ctx, url)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, appsv1.Repository{
+				Repo:      url,
+				Username:  repo.Username,
+				Insecure:  repo.IsInsecure(),
+				EnableLFS: repo.EnableLFS,
+			})
 		}
 	}
 	err = util.RunAllAsync(len(items), func(i int) error {
@@ -95,22 +110,22 @@ func (s *Server) List(ctx context.Context, q *RepoQuery) (*appsv1.RepositoryList
 }
 
 func (s *Server) listAppsPaths(
-	ctx context.Context, repoClient repository.RepoServerServiceClient, repo *appsv1.Repository, revision string, subPath string) (map[string]appsv1.ApplicationSourceType, error) {
+	ctx context.Context, repoClient apiclient.RepoServerServiceClient, repo *appsv1.Repository, revision string, subPath string) (map[string]appsv1.ApplicationSourceType, error) {
 
 	if revision == "" {
 		revision = "HEAD"
 	}
 
-	ksonnetRes, err := repoClient.ListDir(ctx, &repository.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*app.yaml")})
+	ksonnetRes, err := repoClient.ListDir(ctx, &apiclient.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*app.yaml")})
 	if err != nil {
 		return nil, err
 	}
-	componentRes, err := repoClient.ListDir(ctx, &repository.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*components/params.libsonnet")})
+	componentRes, err := repoClient.ListDir(ctx, &apiclient.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*components/params.libsonnet")})
 	if err != nil {
 		return nil, err
 	}
 
-	helmRes, err := repoClient.ListDir(ctx, &repository.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*Chart.yaml")})
+	helmRes, err := repoClient.ListDir(ctx, &apiclient.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*Chart.yaml")})
 	if err != nil {
 		return nil, err
 	}
@@ -144,9 +159,9 @@ func (s *Server) listAppsPaths(
 	return pathToType, nil
 }
 
-func getKustomizationRes(ctx context.Context, repoClient repository.RepoServerServiceClient, repo *appsv1.Repository, revision string, subPath string) (*repository.FileList, error) {
+func getKustomizationRes(ctx context.Context, repoClient apiclient.RepoServerServiceClient, repo *appsv1.Repository, revision string, subPath string) (*apiclient.FileList, error) {
 	for _, kustomization := range kustomize.KustomizationNames {
-		request := repository.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*"+kustomization)}
+		request := apiclient.ListDirRequest{Repo: repo, Revision: revision, Path: path.Join(subPath, "*"+kustomization)}
 		kustomizationRes, err := repoClient.ListDir(ctx, &request)
 		if err != nil {
 			return nil, err
@@ -158,19 +173,13 @@ func getKustomizationRes(ctx context.Context, repoClient repository.RepoServerSe
 }
 
 // ListApps returns list of apps in the repo
-func (s *Server) ListApps(ctx context.Context, q *RepoAppsQuery) (*RepoAppsResponse, error) {
+func (s *Server) ListApps(ctx context.Context, q *repositorypkg.RepoAppsQuery) (*repositorypkg.RepoAppsResponse, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionGet, q.Repo); err != nil {
 		return nil, err
 	}
 	repo, err := s.db.GetRepository(ctx, q.Repo)
 	if err != nil {
-		if errStatus, ok := status.FromError(err); ok && errStatus.Code() == codes.NotFound {
-			repo = &appsv1.Repository{
-				Repo: q.Repo,
-			}
-		} else {
-			return nil, err
-		}
+		return nil, err
 	}
 
 	// Test the repo
@@ -189,26 +198,20 @@ func (s *Server) ListApps(ctx context.Context, q *RepoAppsQuery) (*RepoAppsRespo
 	if err != nil {
 		return nil, err
 	}
-	items := make([]*AppInfo, 0)
+	items := make([]*repositorypkg.AppInfo, 0)
 	for appFilePath, appType := range paths {
-		items = append(items, &AppInfo{Path: path.Dir(appFilePath), Type: string(appType)})
+		items = append(items, &repositorypkg.AppInfo{Path: path.Dir(appFilePath), Type: string(appType)})
 	}
-	return &RepoAppsResponse{Items: items}, nil
+	return &repositorypkg.RepoAppsResponse{Items: items}, nil
 }
 
-func (s *Server) GetAppDetails(ctx context.Context, q *RepoAppDetailsQuery) (*repository.RepoAppDetailsResponse, error) {
+func (s *Server) GetAppDetails(ctx context.Context, q *repositorypkg.RepoAppDetailsQuery) (*apiclient.RepoAppDetailsResponse, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionGet, q.Repo); err != nil {
 		return nil, err
 	}
 	repo, err := s.db.GetRepository(ctx, q.Repo)
 	if err != nil {
-		if errStatus, ok := status.FromError(err); ok && errStatus.Code() == codes.NotFound {
-			repo = &appsv1.Repository{
-				Repo: q.Repo,
-			}
-		} else {
-			return nil, err
-		}
+		return nil, err
 	}
 	conn, repoClient, err := s.repoClientset.NewRepoServerClient()
 	if err != nil {
@@ -219,23 +222,30 @@ func (s *Server) GetAppDetails(ctx context.Context, q *RepoAppDetailsQuery) (*re
 	if err != nil {
 		return nil, err
 	}
-	return repoClient.GetAppDetails(ctx, &repository.RepoServerAppDetailsQuery{
+	buildOptions, err := s.settings.GetKustomizeBuildOptions()
+	if err != nil {
+		return nil, err
+	}
+	return repoClient.GetAppDetails(ctx, &apiclient.RepoServerAppDetailsQuery{
 		Repo:      repo,
 		Revision:  q.Revision,
 		Path:      q.Path,
 		HelmRepos: helmRepos,
 		Helm:      q.Helm,
 		Ksonnet:   q.Ksonnet,
+		KustomizeOptions: &appsv1.KustomizeOptions{
+			BuildOptions: buildOptions,
+		},
 	})
 }
 
 // Create creates a repository
-func (s *Server) Create(ctx context.Context, q *RepoCreateRequest) (*appsv1.Repository, error) {
+func (s *Server) Create(ctx context.Context, q *repositorypkg.RepoCreateRequest) (*appsv1.Repository, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionCreate, q.Repo.Repo); err != nil {
 		return nil, err
 	}
 	r := q.Repo
-	err := git.TestRepo(r.Repo, r.Username, r.Password, r.SSHPrivateKey, r.InsecureIgnoreHostKey)
+	err := git.TestRepo(r.Repo, argo.GetRepoCreds(r), r.IsInsecure(), r.EnableLFS)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +264,7 @@ func (s *Server) Create(ctx context.Context, q *RepoCreateRequest) (*appsv1.Repo
 		if reflect.DeepEqual(existing, r) {
 			repo, err = existing, nil
 		} else if q.Upsert {
-			return s.Update(ctx, &RepoUpdateRequest{Repo: r})
+			return s.Update(ctx, &repositorypkg.RepoUpdateRequest{Repo: r})
 		} else {
 			return nil, status.Errorf(codes.InvalidArgument, "existing repository spec is different; use upsert flag to force update")
 		}
@@ -263,7 +273,7 @@ func (s *Server) Create(ctx context.Context, q *RepoCreateRequest) (*appsv1.Repo
 }
 
 // Update updates a repository
-func (s *Server) Update(ctx context.Context, q *RepoUpdateRequest) (*appsv1.Repository, error) {
+func (s *Server) Update(ctx context.Context, q *repositorypkg.RepoUpdateRequest) (*appsv1.Repository, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionUpdate, q.Repo.Repo); err != nil {
 		return nil, err
 	}
@@ -272,7 +282,7 @@ func (s *Server) Update(ctx context.Context, q *RepoUpdateRequest) (*appsv1.Repo
 }
 
 // Delete updates a repository
-func (s *Server) Delete(ctx context.Context, q *RepoQuery) (*RepoResponse, error) {
+func (s *Server) Delete(ctx context.Context, q *repositorypkg.RepoQuery) (*repositorypkg.RepoResponse, error) {
 	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionDelete, q.Repo); err != nil {
 		return nil, err
 	}
@@ -283,5 +293,28 @@ func (s *Server) Delete(ctx context.Context, q *RepoQuery) (*RepoResponse, error
 	}
 
 	err := s.db.DeleteRepository(ctx, q.Repo)
-	return &RepoResponse{}, err
+	return &repositorypkg.RepoResponse{}, err
+}
+
+// ValidateAccess checks whether access to a repository is possible with the
+// given URL and credentials.
+func (s *Server) ValidateAccess(ctx context.Context, q *repositorypkg.RepoAccessQuery) (*repositorypkg.RepoResponse, error) {
+	if err := s.enf.EnforceErr(ctx.Value("claims"), rbacpolicy.ResourceRepositories, rbacpolicy.ActionCreate, q.Repo); err != nil {
+		return nil, err
+	}
+
+	repo := &appsv1.Repository{
+		Username:          q.Username,
+		Password:          q.Password,
+		SSHPrivateKey:     q.SshPrivateKey,
+		Insecure:          q.Insecure,
+		TLSClientCertData: q.TlsClientCertData,
+		TLSClientCertKey:  q.TlsClientCertKey,
+	}
+	err := git.TestRepo(q.Repo, argo.GetRepoCreds(repo), q.Insecure, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return &repositorypkg.RepoResponse{}, err
 }

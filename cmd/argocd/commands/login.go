@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"time"
 
-	oidc "github.com/coreos/go-oidc"
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/coreos/go-oidc"
+	"github.com/dgrijalva/jwt-go"
 	log "github.com/sirupsen/logrus"
 	"github.com/skratchdot/open-golang/open"
 	"github.com/spf13/cobra"
@@ -17,8 +17,8 @@ import (
 
 	"github.com/argoproj/argo-cd/errors"
 	argocdclient "github.com/argoproj/argo-cd/pkg/apiclient"
-	"github.com/argoproj/argo-cd/server/session"
-	"github.com/argoproj/argo-cd/server/settings"
+	sessionpkg "github.com/argoproj/argo-cd/pkg/apiclient/session"
+	settingspkg "github.com/argoproj/argo-cd/pkg/apiclient/settings"
 	"github.com/argoproj/argo-cd/util"
 	"github.com/argoproj/argo-cd/util/cli"
 	grpc_util "github.com/argoproj/argo-cd/util/grpc"
@@ -88,11 +88,11 @@ func NewLoginCommand(globalClientOpts *argocdclient.ClientOptions) *cobra.Comman
 				httpClient, err := acdClient.HTTPClient()
 				errors.CheckError(err)
 				ctx = oidc.ClientContext(ctx, httpClient)
-				acdSet, err := setIf.Get(ctx, &settings.SettingsQuery{})
+				acdSet, err := setIf.Get(ctx, &settingspkg.SettingsQuery{})
 				errors.CheckError(err)
 				oauth2conf, provider, err := acdClient.OIDCConfig(ctx, acdSet)
 				errors.CheckError(err)
-				tokenString, refreshToken = oauth2Login(ctx, ssoPort, oauth2conf, provider)
+				tokenString, refreshToken = oauth2Login(ctx, ssoPort, acdSet.GetOIDCConfig(), oauth2conf, provider)
 			}
 
 			parser := &jwt.Parser{
@@ -154,7 +154,7 @@ func userDisplayName(claims jwt.MapClaims) string {
 
 // oauth2Login opens a browser, runs a temporary HTTP server to delegate OAuth2 login flow and
 // returns the JWT token and a refresh token (if supported)
-func oauth2Login(ctx context.Context, port int, oauth2conf *oauth2.Config, provider *oidc.Provider) (string, string) {
+func oauth2Login(ctx context.Context, port int, oidcSettings *settingspkg.OIDCConfig, oauth2conf *oauth2.Config, provider *oidc.Provider) (string, string) {
 	oauth2conf.RedirectURL = fmt.Sprintf("http://localhost:%d/auth/callback", port)
 	oidcConf, err := oidcutil.ParseConfig(provider)
 	errors.CheckError(err)
@@ -243,12 +243,17 @@ func oauth2Login(ctx context.Context, port int, oauth2conf *oauth2.Config, provi
 	fmt.Printf("Opening browser for authentication\n")
 
 	var url string
-	grantType := oidcutil.InferGrantType(oauth2conf, oidcConf)
+	grantType := oidcutil.InferGrantType(oidcConf)
+	opts := []oauth2.AuthCodeOption{oauth2.AccessTypeOffline}
+	if claimsRequested := oidcSettings.GetIDTokenClaims(); claimsRequested != nil {
+		opts = oidcutil.AppendClaimsAuthenticationRequestParameter(opts, claimsRequested)
+	}
+
 	switch grantType {
 	case oidcutil.GrantTypeAuthorizationCode:
-		url = oauth2conf.AuthCodeURL(stateNonce, oauth2.AccessTypeOffline)
+		url = oauth2conf.AuthCodeURL(stateNonce, opts...)
 	case oidcutil.GrantTypeImplicit:
-		url = oidcutil.ImplicitFlowURL(oauth2conf, stateNonce, oauth2.AccessTypeOffline)
+		url = oidcutil.ImplicitFlowURL(oauth2conf, stateNonce, opts...)
 	default:
 		log.Fatalf("Unsupported grant type: %v", grantType)
 	}
@@ -278,7 +283,7 @@ func passwordLogin(acdClient argocdclient.Client, username, password string) str
 	username, password = cli.PromptCredentials(username, password)
 	sessConn, sessionIf := acdClient.NewSessionClientOrDie()
 	defer util.Close(sessConn)
-	sessionRequest := session.SessionCreateRequest{
+	sessionRequest := sessionpkg.SessionCreateRequest{
 		Username: username,
 		Password: password,
 	}

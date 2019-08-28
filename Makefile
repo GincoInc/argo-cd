@@ -1,4 +1,4 @@
-PACKAGE=github.com/argoproj/argo-cd
+PACKAGE=github.com/argoproj/argo-cd/common
 CURRENT_DIR=$(shell pwd)
 DIST_DIR=${CURRENT_DIR}/dist
 CLI_NAME=argocd
@@ -9,15 +9,25 @@ GIT_COMMIT=$(shell git rev-parse HEAD)
 GIT_TAG=$(shell if [ -z "`git status --porcelain`" ]; then git describe --exact-match --tags HEAD 2>/dev/null; fi)
 GIT_TREE_STATE=$(shell if [ -z "`git status --porcelain`" ]; then echo "clean" ; else echo "dirty"; fi)
 PACKR_CMD=$(shell if [ "`which packr`" ]; then echo "packr"; else echo "go run vendor/github.com/gobuffalo/packr/packr/main.go"; fi)
-TEST_CMD=$(shell [ "`which gotestsum`" != "" ] && echo gotestsum -- || echo go test)
+
+define run-in-dev-tool
+    docker run --rm -it -u $(shell id -u) -e HOME=/home/user -v ${CURRENT_DIR}:/go/src/github.com/argoproj/argo-cd -w /go/src/github.com/argoproj/argo-cd argocd-dev-tools bash -c "GOPATH=/go $(1)"
+endef
+
+PATH:=$(PATH):$(PWD)/hack
 
 # docker image publishing options
-DOCKER_PUSH=false
-IMAGE_TAG=latest
+DOCKER_PUSH?=false
+IMAGE_TAG?=
 # perform static compilation
-STATIC_BUILD=true
+STATIC_BUILD?=true
 # build development images
-DEV_IMAGE=false
+DEV_IMAGE?=false
+# lint is memory and CPU intensive, so we can limit on CI to mitigate OOM
+LINT_GOGC?=off
+LINT_CONCURRENCY?=8
+# Set timeout for linter
+LINT_DEADLINE?=1m0s
 
 override LDFLAGS += \
   -X ${PACKAGE}.version=${VERSION} \
@@ -59,8 +69,12 @@ openapigen:
 clientgen:
 	./hack/update-codegen.sh
 
+.PHONY: codegen-local
+codegen-local: protogen clientgen openapigen manifests-local
+
 .PHONY: codegen
-codegen: protogen clientgen openapigen
+codegen: dev-tools-image
+	$(call run-in-dev-tool,make codegen-local)
 
 .PHONY: cli
 cli: clean-debug
@@ -76,21 +90,30 @@ release-cli: clean-debug image
 .PHONY: argocd-util
 argocd-util: clean-debug
 	# Build argocd-util as a statically linked binary, so it could run within the alpine-based dex container (argoproj/argo-cd#844)
-	CGO_ENABLED=0 go build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/argocd-util ./cmd/argocd-util
+	CGO_ENABLED=0 ${PACKR_CMD} build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/argocd-util ./cmd/argocd-util
+
+.PHONY: dev-tools-image
+dev-tools-image:
+	docker build -t argocd-dev-tools ./hack -f ./hack/Dockerfile.dev-tools
+
+.PHONY: manifests-local
+manifests-local:
+	./hack/update-manifests.sh
 
 .PHONY: manifests
-manifests:
-	./hack/update-manifests.sh
+manifests: dev-tools-image
+	$(call run-in-dev-tool,make manifests-local IMAGE_TAG='${IMAGE_TAG}')
+
 
 # NOTE: we use packr to do the build instead of go, since we embed swagger files and policy.csv
 # files into the go binary
 .PHONY: server
 server: clean-debug
 	CGO_ENABLED=0 ${PACKR_CMD} build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/argocd-server ./cmd/argocd-server
-	
+
 .PHONY: repo-server
 repo-server:
-	CGO_ENABLED=0 go build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/argocd-repo-server ./cmd/argocd-repo-server
+	CGO_ENABLED=0 ${PACKR_CMD} build -v -i -ldflags '${LDFLAGS}' -o ${DIST_DIR}/argocd-repo-server ./cmd/argocd-repo-server
 
 .PHONY: controller
 controller:
@@ -124,7 +147,7 @@ endif
 .PHONY: builder-image
 builder-image:
 	docker build  -t $(IMAGE_PREFIX)argo-cd-ci-builder:$(IMAGE_TAG) --target builder .
-	docker push $(IMAGE_PREFIX)argo-cd-ci-builder:$(IMAGE_TAG)
+	@if [ "$(DOCKER_PUSH)" = "true" ] ; then docker push $(IMAGE_PREFIX)argo-cd-ci-builder:$(IMAGE_TAG) ; fi
 
 .PHONY: dep-ensure
 dep-ensure:
@@ -132,26 +155,38 @@ dep-ensure:
 
 .PHONY: lint
 lint:
-	golangci-lint run --fix
+	# golangci-lint does not do a good job of formatting imports
+	goimports -local github.com/argoproj/argo-cd -w `find . ! -path './vendor/*' ! -path './pkg/client/*' -type f -name '*.go'`
+	GOGC=$(LINT_GOGC) golangci-lint run --fix --verbose --concurrency $(LINT_CONCURRENCY) --deadline $(LINT_DEADLINE)
 
 .PHONY: build
 build:
-	go build `go list ./... | grep -v resource_customizations`
+	go build -v `go list ./... | grep -v 'resource_customizations\|test/e2e'`
 
 .PHONY: test
 test:
-	$(TEST_CMD) -covermode=count -coverprofile=coverage.out `go list ./... | grep -v "github.com/argoproj/argo-cd/test/e2e"`
+	go test -v -covermode=count -coverprofile=coverage.out `go list ./... | grep -v "test/e2e"`
+
+.PHONY: cover
+cover:
+	go tool cover -html=coverage.out
 
 .PHONY: test-e2e
 test-e2e: cli
-	$(TEST_CMD) -v -failfast -timeout 20m ./test/e2e
+	go test -v -timeout 10m ./test/e2e
 
 .PHONY: start-e2e
 start-e2e: cli
+	killall goreman || true
+	# check we can connect to Docker to start Redis
+	docker version
 	kubectl create ns argocd-e2e || true
-	kubens argocd-e2e
+	kubectl config set-context --current --namespace=argocd-e2e
 	kustomize build test/manifests/base | kubectl apply -f -
-	make start
+	# set paths for locally managed ssh known hosts and tls certs data
+	ARGOCD_SSH_DATA_PATH=/tmp/argo-e2e/app/config/ssh \
+	ARGOCD_TLS_DATA_PATH=/tmp/argo-e2e/app/config/tls \
+		goreman start
 
 # Cleans VSCode debug.test files from sub-dirs to prevent them from being included in packr boxes
 .PHONY: clean-debug
@@ -165,6 +200,9 @@ clean: clean-debug
 .PHONY: start
 start:
 	killall goreman || true
+	# check we can connect to Docker to start Redis
+	docker version
+	kubectl create ns argocd || true
 	kubens argocd
 	goreman start
 
@@ -178,4 +216,4 @@ release-precheck: manifests
 	@if [ "$(GIT_TAG)" != "v`cat VERSION`" ]; then echo 'VERSION does not match git tag'; exit 1; fi
 
 .PHONY: release
-release: release-precheck precheckin image release-cli
+release: pre-commit release-precheck image release-cli

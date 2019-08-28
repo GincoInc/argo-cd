@@ -15,14 +15,36 @@ const (
 	ArgoCDConfigMapName     = "argocd-cm"
 	ArgoCDSecretName        = "argocd-secret"
 	ArgoCDRBACConfigMapName = "argocd-rbac-cm"
+	// Contains SSH known hosts data for connecting repositories. Will get mounted as volume to pods
+	ArgoCDKnownHostsConfigMapName = "argocd-ssh-known-hosts-cm"
+	// Contains TLS certificate data for connecting repositories. Will get mounted as volume to pods
+	ArgoCDTLSCertsConfigMapName = "argocd-tls-certs-cm"
 )
 
+// Default system namespace
 const (
-	PortAPIServer              = 8080
-	PortRepoServer             = 8081
-	PortArgoCDMetrics          = 8082
-	PortArgoCDAPIServerMetrics = 8083
-	PortRepoServerMetrics      = 8084
+	DefaultSystemNamespace = "kube-system"
+)
+
+// Default listener ports for ArgoCD components
+const (
+	DefaultPortAPIServer              = 8080
+	DefaultPortRepoServer             = 8081
+	DefaultPortArgoCDMetrics          = 8082
+	DefaultPortArgoCDAPIServerMetrics = 8083
+	DefaultPortRepoServerMetrics      = 8084
+)
+
+// Default paths on the pod's file system
+const (
+	// The default base path where application config is located
+	DefaultPathAppConfig = "/app/config"
+	// The default path where TLS certificates for repositories are located
+	DefaultPathTLSConfig = "/app/config/tls"
+	// The default path where SSH known hosts are stored
+	DefaultPathSSHConfig = "/app/config/ssh"
+	// Default name for the SSH known hosts file
+	DefaultSSHKnownHostsName = "ssh_known_hosts"
 )
 
 // Argo CD application related constants
@@ -53,6 +75,8 @@ const (
 	LoginEndpoint = "/auth/login"
 	// CallbackEndpoint is Argo CD's final callback endpoint we reach after OAuth 2.0 login flow has been completed
 	CallbackEndpoint = "/auth/callback"
+	// DexCallbackEndpoint is Argo CD's final callback endpoint when Dex is configured
+	DexCallbackEndpoint = "/api/dex/callback"
 	// ArgoCDClientAppName is name of the Oauth client app used when registering our web app to dex
 	ArgoCDClientAppName = "Argo CD"
 	// ArgoCDClientAppID is the Oauth client ID we will use when registering our app to dex
@@ -75,6 +99,12 @@ const (
 	// LabelValueSecretTypeCluster indicates a secret type of cluster
 	LabelValueSecretTypeCluster = "cluster"
 
+	// AnnotationCompareOptions is a comma-separated list of options for comparison
+	AnnotationCompareOptions = "argocd.argoproj.io/compare-options"
+	// AnnotationSyncOptions is a comma-separated list of options for syncing
+	AnnotationSyncOptions = "argocd.argoproj.io/sync-options"
+	// AnnotationSyncWave indicates which wave of the sync the resource or hook should be in
+	AnnotationSyncWave = "argocd.argoproj.io/sync-wave"
 	// AnnotationKeyHook contains the hook type of a resource
 	AnnotationKeyHook = "argocd.argoproj.io/hook"
 	// AnnotationKeyHookDeletePolicy is the policy of deleting a hook
@@ -86,10 +116,6 @@ const (
 	AnnotationKeyManagedBy = "managed-by"
 	// AnnotationValueManagedByArgoCD is a 'managed-by' annotation value for resources managed by Argo CD
 	AnnotationValueManagedByArgoCD = "argocd.argoproj.io"
-	// AnnotationKeyHelmHook is the helm hook annotation
-	AnnotationKeyHelmHook = "helm.sh/hook"
-	// AnnotationValueHelmHookCRDInstall is a value of crd helm hook
-	AnnotationValueHelmHookCRDInstall = "crd-install"
 	// ResourcesFinalizerName the finalizer value which we inject to finalize deletion of an application
 	ResourcesFinalizerName = "resources-finalizer.argocd.argoproj.io"
 )
@@ -103,14 +129,18 @@ const (
 	// EnvVarFakeInClusterConfig is an environment variable to fake an in-cluster RESTConfig using
 	// the current kubectl context (for development purposes)
 	EnvVarFakeInClusterConfig = "ARGOCD_FAKE_IN_CLUSTER"
+	// Overrides the location where SSH known hosts for repo access data is stored
+	EnvVarSSHDataPath = "ARGOCD_SSH_DATA_PATH"
+	// Overrides the location where TLS certificate for repo access data is stored
+	EnvVarTLSDataPath = "ARGOCD_TLS_DATA_PATH"
 )
 
 const (
 	// MinClientVersion is the minimum client version that can interface with this API server.
 	// When introducing breaking changes to the API or datastructures, this number should be bumped.
 	// The value here may be lower than the current value in VERSION
-	MinClientVersion = "0.12.0"
+	MinClientVersion = "1.0.0"
 	// CacheVersion is a objects version cached using util/cache/cache.go.
 	// Number should be bumped in case of backward incompatible change to make sure cache is invalidated after upgrade.
-	CacheVersion = "0.13.0"
+	CacheVersion = "1.0.0"
 )

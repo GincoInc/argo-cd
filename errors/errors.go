@@ -10,3 +10,11 @@ func CheckError(err error) {
 		log.Fatal(err)
 	}
 }
+
+// panics if there is an error.
+// This returns the first value so you can use it if you cast it:
+// text := FailOrErr(Foo)).(string)
+func FailOnErr(v interface{}, err error) interface{} {
+	CheckError(err)
+	return v
+}

@@ -1,5 +1,5 @@
 run:
-  deadline: 8m
+  deadline: 2m
   skip-files:
     - ".*\\.pb\\.go"
   skip-dirs:
@@ -19,3 +19,4 @@ linters:
     - ineffassign
     - unconvert
     - misspell
+    - unparam

@@ -9,7 +9,6 @@ import (
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	applister "github.com/argoproj/argo-cd/pkg/client/listers/application/v1alpha1"
 	jwtutil "github.com/argoproj/argo-cd/util/jwt"
-	projectutil "github.com/argoproj/argo-cd/util/project"
 	"github.com/argoproj/argo-cd/util/rbac"
 )
 
@@ -18,12 +17,18 @@ const (
 	ResourceProjects     = "projects"
 	ResourceApplications = "applications"
 	ResourceRepositories = "repositories"
+	ResourceCertificates = "certificates"
 
-	ActionGet    = "get"
-	ActionCreate = "create"
-	ActionUpdate = "update"
-	ActionDelete = "delete"
-	ActionSync   = "sync"
+	ActionGet      = "get"
+	ActionCreate   = "create"
+	ActionUpdate   = "update"
+	ActionDelete   = "delete"
+	ActionSync     = "sync"
+	ActionOverride = "override"
+)
+
+var (
+	defaultScopes = []string{"groups"}
 )
 
 // RBACPolicyEnforcer provides an RBAC Claims Enforcer which additionally consults AppProject
@@ -32,6 +37,7 @@ const (
 type RBACPolicyEnforcer struct {
 	enf        *rbac.Enforcer
 	projLister applister.AppProjectNamespaceLister
+	scopes     []string
 }
 
 // NewRBACPolicyEnforcer returns a new RBAC Enforcer for the Argo CD API Server
@@ -39,7 +45,12 @@ func NewRBACPolicyEnforcer(enf *rbac.Enforcer, projLister applister.AppProjectNa
 	return &RBACPolicyEnforcer{
 		enf:        enf,
 		projLister: projLister,
+		scopes:     nil,
 	}
+}
+
+func (p *RBACPolicyEnforcer) SetScopes(scopes []string) {
+	p.scopes = scopes
 }
 
 // EnforceClaims is an RBAC claims enforcer specific to the Argo CD API server
@@ -68,8 +79,12 @@ func (p *RBACPolicyEnforcer) EnforceClaims(claims jwt.Claims, rvals ...interface
 		return true
 	}
 
+	scopes := p.scopes
+	if scopes == nil {
+		scopes = defaultScopes
+	}
 	// Finally check if any of the user's groups grant them permissions
-	groups := jwtutil.GetGroups(mapClaims)
+	groups := jwtutil.GetScopeValues(mapClaims, scopes)
 	for _, group := range groups {
 		vals := append([]interface{}{group}, rvals[1:]...)
 		if p.enf.EnforceRuntimePolicy(runtimePolicy, vals...) {
@@ -125,7 +140,7 @@ func (p *RBACPolicyEnforcer) enforceProjectToken(subject string, claims jwt.MapC
 	if err != nil {
 		return false
 	}
-	_, _, err = projectutil.GetJWTToken(proj, roleName, iat)
+	_, _, err = proj.GetJWTToken(roleName, iat)
 	if err != nil {
 		// if we get here the token is still valid, but has been revoked (no longer exists in the project)
 		return false

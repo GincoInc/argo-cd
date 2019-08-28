@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,11 +13,13 @@ import (
 	argoappv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	applister "github.com/argoproj/argo-cd/pkg/client/listers/application/v1alpha1"
 	"github.com/argoproj/argo-cd/util/git"
+	"github.com/argoproj/argo-cd/util/healthz"
 )
 
 type MetricsServer struct {
 	*http.Server
 	syncCounter        *prometheus.CounterVec
+	k8sRequestCounter  *prometheus.CounterVec
 	reconcileHistogram *prometheus.HistogramVec
 }
 
@@ -57,12 +60,13 @@ var (
 )
 
 // NewMetricsServer returns a new prometheus server which collects application metrics
-func NewMetricsServer(addr string, appLister applister.ApplicationLister) *MetricsServer {
+func NewMetricsServer(addr string, appLister applister.ApplicationLister, healthCheck func() error) *MetricsServer {
 	mux := http.NewServeMux()
 	appRegistry := NewAppRegistry(appLister)
 	appRegistry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
 	appRegistry.MustRegister(prometheus.NewGoCollector())
 	mux.Handle(MetricsPath, promhttp.HandlerFor(appRegistry, promhttp.HandlerOpts{}))
+	healthz.ServeHealthCheck(mux, healthCheck)
 
 	syncCounter := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -72,6 +76,14 @@ func NewMetricsServer(addr string, appLister applister.ApplicationLister) *Metri
 		append(descAppDefaultLabels, "phase"),
 	)
 	appRegistry.MustRegister(syncCounter)
+	k8sRequestCounter := prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "argocd_app_k8s_request_total",
+			Help: "Number of kubernetes requests executed during application reconciliation.",
+		},
+		append(descAppDefaultLabels, "response_code"),
+	)
+	appRegistry.MustRegister(k8sRequestCounter)
 
 	reconcileHistogram := prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -91,6 +103,7 @@ func NewMetricsServer(addr string, appLister applister.ApplicationLister) *Metri
 			Handler: mux,
 		},
 		syncCounter:        syncCounter,
+		k8sRequestCounter:  k8sRequestCounter,
 		reconcileHistogram: reconcileHistogram,
 	}
 }
@@ -101,6 +114,11 @@ func (m *MetricsServer) IncSync(app *argoappv1.Application, state *argoappv1.Ope
 		return
 	}
 	m.syncCounter.WithLabelValues(app.Namespace, app.Name, app.Spec.GetProject(), string(state.Phase)).Inc()
+}
+
+// IncKubernetesRequest increments the kubernetes requests counter for an application
+func (m *MetricsServer) IncKubernetesRequest(app *argoappv1.Application, statusCode int) {
+	m.k8sRequestCounter.WithLabelValues(app.Namespace, app.Name, app.Spec.GetProject(), strconv.Itoa(statusCode)).Inc()
 }
 
 // IncReconcile increments the reconcile counter for an application

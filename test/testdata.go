@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	"github.com/argoproj/argo-cd/common"
+	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
 	apps "github.com/argoproj/argo-cd/pkg/client/clientset/versioned/fake"
 	appinformer "github.com/argoproj/argo-cd/pkg/client/informers/externalversions"
 	applister "github.com/argoproj/argo-cd/pkg/client/listers/application/v1alpha1"
@@ -51,6 +52,30 @@ func NewPod() *unstructured.Unstructured {
 		panic(err)
 	}
 	return &un
+}
+
+// DEPRECATED
+// use `Hook(NewPod())` or similar instead
+func NewHook(hookType v1alpha1.HookType) *unstructured.Unstructured {
+	return Hook(NewPod(), hookType)
+}
+
+func Hook(obj *unstructured.Unstructured, hookType v1alpha1.HookType) *unstructured.Unstructured {
+	return Annotate(obj, "argocd.argoproj.io/hook", string(hookType))
+}
+
+func HelmHook(obj *unstructured.Unstructured, hookType string) *unstructured.Unstructured {
+	return Annotate(obj, "helm.sh/hook", hookType)
+}
+
+func Annotate(obj *unstructured.Unstructured, key, val string) *unstructured.Unstructured {
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[key] = val
+	obj.SetAnnotations(annotations)
+	return obj
 }
 
 var ServiceManifest = []byte(`
@@ -181,6 +206,9 @@ func NewFakeConfigMap() *apiv1.ConfigMap {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      common.ArgoCDConfigMapName,
 			Namespace: FakeArgoCDNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/part-of": "argocd",
+			},
 		},
 		Data: make(map[string]string),
 	}

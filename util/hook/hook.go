@@ -1,55 +1,44 @@
 package hook
 
 import (
-	"strings"
-
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	"github.com/argoproj/argo-cd/common"
-	argoappv1 "github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	helmhook "github.com/argoproj/argo-cd/util/helm/hook"
+	"github.com/argoproj/argo-cd/util/resource"
 )
 
-// IsHook indicates if the object is either a Argo CD or Helm hook
 func IsHook(obj *unstructured.Unstructured) bool {
-	return IsArgoHook(obj) || IsHelmHook(obj)
+	_, ok := obj.GetAnnotations()[common.AnnotationKeyHook]
+	if ok {
+		return !Skip(obj)
+	}
+	return helmhook.IsHook(obj)
 }
 
-// IsHelmHook indicates if the supplied object is a helm hook
-func IsHelmHook(obj *unstructured.Unstructured) bool {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		return false
-	}
-	hooks, ok := annotations[common.AnnotationKeyHelmHook]
-	if ok && hasHook(hooks, common.AnnotationValueHelmHookCRDInstall) {
-		return false
-	}
-	return ok
-}
-
-func hasHook(hooks string, hook string) bool {
-	for _, item := range strings.Split(hooks, ",") {
-		if strings.TrimSpace(item) == hook {
-			return true
+func Skip(obj *unstructured.Unstructured) bool {
+	for _, hookType := range Types(obj) {
+		if hookType == v1alpha1.HookTypeSkip {
+			return len(Types(obj)) == 1
 		}
 	}
 	return false
 }
 
-// IsArgoHook indicates if the supplied object is an Argo CD application lifecycle hook
-// (vs. a normal, synced application resource)
-func IsArgoHook(obj *unstructured.Unstructured) bool {
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		return false
-	}
-	resHookTypes := strings.Split(annotations[common.AnnotationKeyHook], ",")
-	for _, hookType := range resHookTypes {
-		hookType = strings.TrimSpace(hookType)
-		switch argoappv1.HookType(hookType) {
-		case argoappv1.HookTypePreSync, argoappv1.HookTypeSync, argoappv1.HookTypePostSync:
-			return true
+func Types(obj *unstructured.Unstructured) []v1alpha1.HookType {
+	var types []v1alpha1.HookType
+	for _, text := range resource.GetAnnotationCSVs(obj, common.AnnotationKeyHook) {
+		t, ok := v1alpha1.NewHookType(text)
+		if ok {
+			types = append(types, t)
 		}
 	}
-	return false
+	// we ignore Helm hooks if we have Argo hook
+	if len(types) == 0 {
+		for _, t := range helmhook.Types(obj) {
+			types = append(types, t.HookType())
+		}
+	}
+	return types
 }

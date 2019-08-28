@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/argoproj/argo-cd/common"
 	"github.com/argoproj/argo-cd/pkg/apis/application/v1alpha1"
+	"github.com/argoproj/argo-cd/test/e2e/fixture"
 	"github.com/argoproj/argo-cd/util/argo"
 )
 
@@ -36,14 +38,15 @@ func assertProjHasEvent(t *testing.T, a *v1alpha1.AppProject, message string, re
 }
 
 func TestProjectCreation(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
-	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
+	projectName := "proj-" + fixture.Name()
 	_, err := fixture.RunCli("proj", "create", projectName,
 		"--description", "Test description",
 		"-d", "https://192.168.99.100:8443,default",
 		"-d", "https://192.168.99.100:8443,service",
-		"-s", "https://github.com/argoproj/argo-cd.git")
+		"-s", "https://github.com/argoproj/argo-cd.git",
+		"--orphaned-resources")
 	assert.Nil(t, err)
 
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
@@ -60,11 +63,35 @@ func TestProjectCreation(t *testing.T) {
 	assert.Equal(t, 1, len(proj.Spec.SourceRepos))
 	assert.Equal(t, "https://github.com/argoproj/argo-cd.git", proj.Spec.SourceRepos[0])
 
+	assert.NotNil(t, proj.Spec.OrphanedResources)
+	assert.True(t, proj.Spec.OrphanedResources.IsWarn())
+
 	assertProjHasEvent(t, proj, "create", argo.EventReasonResourceCreated)
+
+	// create a manifest with the same name to upsert
+	newDescription := "Upserted description"
+	proj.Spec.Description = newDescription
+	proj.ResourceVersion = ""
+	data, err := json.Marshal(proj)
+	stdinString := string(data)
+	assert.NoError(t, err)
+
+	// fail without upsert flag
+	_, err = fixture.RunCliWithStdin(stdinString, "proj", "create",
+		"-f", "-")
+	assert.Error(t, err)
+
+	// succeed with the upsert flag
+	_, err = fixture.RunCliWithStdin(stdinString, "proj", "create",
+		"-f", "-", "--upsert")
+	assert.NoError(t, err)
+	proj, err = fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, newDescription, proj.Spec.Description)
 }
 
 func TestProjectDeletion(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{ObjectMeta: metav1.ObjectMeta{Name: projectName}})
@@ -79,7 +106,7 @@ func TestProjectDeletion(t *testing.T) {
 }
 
 func TestSetProject(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{ObjectMeta: metav1.ObjectMeta{Name: projectName}})
@@ -88,7 +115,8 @@ func TestSetProject(t *testing.T) {
 	_, err = fixture.RunCli("proj", "set", projectName,
 		"--description", "updated description",
 		"-d", "https://192.168.99.100:8443,default",
-		"-d", "https://192.168.99.100:8443,service")
+		"-d", "https://192.168.99.100:8443,service",
+		"--orphaned-resources-warn=false")
 	assert.NoError(t, err)
 
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
@@ -101,11 +129,15 @@ func TestSetProject(t *testing.T) {
 
 	assert.Equal(t, "https://192.168.99.100:8443", proj.Spec.Destinations[1].Server)
 	assert.Equal(t, "service", proj.Spec.Destinations[1].Namespace)
+
+	assert.NotNil(t, proj.Spec.OrphanedResources)
+	assert.False(t, proj.Spec.OrphanedResources.IsWarn())
+
 	assertProjHasEvent(t, proj, "update", argo.EventReasonResourceUpdated)
 }
 
 func TestAddProjectDestination(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{ObjectMeta: metav1.ObjectMeta{Name: projectName}})
@@ -126,7 +158,7 @@ func TestAddProjectDestination(t *testing.T) {
 		"https://192.168.99.100:8443",
 		"test1",
 	)
-	assert.NotNil(t, err)
+	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "already defined"))
 
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
@@ -140,7 +172,7 @@ func TestAddProjectDestination(t *testing.T) {
 }
 
 func TestRemoveProjectDestination(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{
@@ -170,8 +202,8 @@ func TestRemoveProjectDestination(t *testing.T) {
 		"https://192.168.99.100:8443",
 		"test1",
 	)
-	assert.NotNil(t, err)
-	assert.True(t, strings.Contains(err.Error(), "does not exist"))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
 
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
 	if err != nil {
@@ -183,7 +215,7 @@ func TestRemoveProjectDestination(t *testing.T) {
 }
 
 func TestAddProjectSource(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{ObjectMeta: metav1.ObjectMeta{Name: projectName}})
@@ -209,7 +241,7 @@ func TestAddProjectSource(t *testing.T) {
 }
 
 func TestRemoveProjectSource(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	_, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Create(&v1alpha1.AppProject{
@@ -226,7 +258,7 @@ func TestRemoveProjectSource(t *testing.T) {
 	assert.NoError(t, err)
 
 	_, err = fixture.RunCli("proj", "remove-source", projectName, "https://github.com/argoproj/argo-cd.git")
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	proj, err := fixture.AppClientset.ArgoprojV1alpha1().AppProjects(fixture.ArgoCDNamespace).Get(projectName, metav1.GetOptions{})
 	assert.NoError(t, err)
@@ -236,7 +268,7 @@ func TestRemoveProjectSource(t *testing.T) {
 }
 
 func TestUseJWTToken(t *testing.T) {
-	fixture.EnsureCleanState()
+	fixture.EnsureCleanState(t)
 
 	projectName := "proj-" + strconv.FormatInt(time.Now().Unix(), 10)
 	appName := "app-" + strconv.FormatInt(time.Now().Unix(), 10)
@@ -247,7 +279,7 @@ func TestUseJWTToken(t *testing.T) {
 		},
 		Spec: v1alpha1.ApplicationSpec{
 			Source: v1alpha1.ApplicationSource{
-				RepoURL: fixture.RepoURL(),
+				RepoURL: fixture.RepoURL(fixture.RepoURLTypeFile),
 				Path:    "guestbook",
 			},
 			Destination: v1alpha1.ApplicationDestination{
@@ -270,15 +302,16 @@ func TestUseJWTToken(t *testing.T) {
 	assert.Nil(t, err)
 
 	_, err = fixture.AppClientset.ArgoprojV1alpha1().Applications(fixture.ArgoCDNamespace).Create(testApp)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	_, err = fixture.RunCli("proj", "role", "create", projectName, roleName)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
 	_, err = fixture.RunCli("proj", "role", "create-token", projectName, roleName)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
 
-	_, err = fixture.RunCli("proj", "role", "add-policy", projectName, roleName, "-a", "get", "-o", "*", "-p", "allow")
-	assert.Nil(t, err)
-
+	for _, action := range []string{"get", "update", "sync", "create", "override", "*"} {
+		_, err = fixture.RunCli("proj", "role", "add-policy", projectName, roleName, "-a", action, "-o", "*", "-p", "allow")
+		assert.NoError(t, err)
+	}
 }
